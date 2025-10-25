@@ -1,0 +1,21 @@
+[package]
+name = "sparse_bullshark"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Link to your local shared library
+shared = { path = "../shared" }
+
+# Inherit all other dependencies from the workspace
+tokio = { workspace = true, features = ["time", "rt", "rt-multi-thread", "macros", "net", "sync", "io-util", "fs", "tracing"] }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["batch", "serde"] }
+serde = { workspace = true, features = ["derive"] }
+bincode = { workspace = true }
+base64 = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+hex = { workspace = true }

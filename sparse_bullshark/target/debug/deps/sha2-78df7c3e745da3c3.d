@@ -1,0 +1,12 @@
+C:\Users\henri\OneDrive\Ambiente de Trabalho\tese\rust exercises\Masses\Sparse-BullShark\target\debug\deps\sha2-78df7c3e745da3c3.d: C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\lib.rs C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\consts.rs C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\sha256.rs C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\sha512.rs C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\sha256\soft.rs C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\sha256\x86.rs C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\sha512\soft.rs C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\sha512\x86.rs
+
+C:\Users\henri\OneDrive\Ambiente de Trabalho\tese\rust exercises\Masses\Sparse-BullShark\target\debug\deps\libsha2-78df7c3e745da3c3.rmeta: C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\lib.rs C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\consts.rs C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\sha256.rs C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\sha512.rs C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\sha256\soft.rs C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\sha256\x86.rs C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\sha512\soft.rs C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\sha512\x86.rs
+
+C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\lib.rs:
+C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\consts.rs:
+C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\sha256.rs:
+C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\sha512.rs:
+C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\sha256\soft.rs:
+C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\sha256\x86.rs:
+C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\sha512\soft.rs:
+C:\Users\henri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha2-0.9.9\src\sha512\x86.rs:

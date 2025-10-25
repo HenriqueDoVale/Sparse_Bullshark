@@ -1,0 +1,22 @@
+[package]
+name = "shared"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "shared"
+path = "src/lib.rs"
+
+[dependencies]
+# Inherit all dependencies from the workspace
+chrono = { workspace = true }
+csv = { workspace = true }
+toml = { workspace = true }
+base64 = { workspace = true }
+tokio = { workspace = true, features = ["time", "rt", "rt-multi-thread", "macros", "net", "sync", "io-util"] }
+serde = { workspace = true, features = ["derive"] }
+rand = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+bincode = { workspace = true }
+ed25519-dalek = { workspace = true }

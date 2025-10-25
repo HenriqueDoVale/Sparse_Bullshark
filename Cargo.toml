@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "shared",
+    "sparse_bullshark",
+]
+
+# All dependencies are defined ONCE here
+[workspace.dependencies]
+# From sparse_bullshark
+tokio = { version = "1.40.0", features = ["time", "rt", "rt-multi-thread", "macros", "net", "sync", "io-util", "fs", "tracing"] }
+rand = "0.8.5" # Using the stable 0.8 version
+rand_chacha = "0.3.1"
+sha2 = "0.10.9" # Using the stable 0.10 version
+ed25519-dalek = { version = "1.0.1", features = ["batch", "serde"] }
+serde = { version = "1.0.210", features = ["derive"] } # Using the latest 1.0 version
+bincode = "1.3"
+base64 = "0.22.1"
+env_logger = "0.11.8"
+log = "0.4.28"
+hex = "0.4.3"
+
+# From shared
+chrono = "0.4.38"
+csv = "1.3.1"
+toml = "0.8.19"
+serde_json = "1.0.132"
