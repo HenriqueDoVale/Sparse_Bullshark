@@ -98,6 +98,7 @@ impl SparseBullshark {
                     );
                     // This is where you would deliver the block to your application.
                     // For example: self.state_machine.execute(vertex.block);
+                    self.finalized_block_count += 1;
                     already_ordered.insert(vertex.hash.clone());
                 }
             }

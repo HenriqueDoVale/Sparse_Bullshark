@@ -7,7 +7,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::mpsc::{self, Sender},
-    time::{sleep, Duration},
+    time::{sleep, Duration, Instant},
 };
 use shared::{domain::environment::Environment, transaction_generator::TransactionGenerator};
 use crate::{
@@ -23,6 +23,7 @@ const SIGNATURE_BYTES_LENGTH: usize = 64;
 const MESSAGE_CHANNEL_SIZE: usize = 1024;
 const SOCKET_BINDING_DELAY: u64 = 2;
 const MESSAGE_BYTES_LENGTH: usize = 4;
+const EXECUTION_DURATION: u64 = 120;
 
 pub struct SparseBullshark {
     pub environment: Environment,
@@ -35,6 +36,7 @@ pub struct SparseBullshark {
     round: u64,
     pub last_ordered_round: u64,
     pub ordered_anchors_stack: Vec<Vertex>,
+    pub finalized_block_count: usize,
 }
 
 impl SparseBullshark {
@@ -58,6 +60,7 @@ impl SparseBullshark {
             round: 1,
             last_ordered_round: 0,
             ordered_anchors_stack: Vec::new(),
+            finalized_block_count: 0,
         };
         node.add_genesis_block();
         node
@@ -92,7 +95,9 @@ impl SparseBullshark {
 
         self.start_message_dispatcher(dispatcher_rx, connections);
 
-        loop {
+        let execution_duration = Duration::from_secs(EXECUTION_DURATION);
+        let start_time = Instant::now();
+        while start_time.elapsed() < execution_duration {
             tokio::select! {
                 Some((sender_id, message)) = message_rx.recv() => {
                     // CATCH PANIC: The bug is likely a panic inside the validation logic.
@@ -103,6 +108,7 @@ impl SparseBullshark {
                                 if self.validate_vertex(&vm.vertex, vm.vertex.round, vm.sender) {
                                     info!("[Node {}] Vertex from Node {} in round {} is VALID", self.environment.my_node.id, vm.sender, vm.vertex.round);
                                     self.dag.insert(vm.vertex.clone());
+                                    self.try_committing(vm.vertex.clone());
                                 } else {
                                     warn!("[Node {}] Vertex from Node {} in round {} is INVALID", self.environment.my_node.id, vm.sender, vm.vertex.round);
                                 }
@@ -131,6 +137,16 @@ impl SparseBullshark {
                 }
             }
         }
+        info!("[Node {}] Execution finished after {} seconds.", self.environment.my_node.id, start_time.elapsed().as_secs());
+        // You can add logic here to print final statistics, e.g., total blocks ordered.
+        println!("[Node {}] Final ordered round: {}", self.environment.my_node.id, self.last_ordered_round);
+        println!("Blocks finalized: {}", self.finalized_block_count);
+
+        // Allow some time for final messages to flush
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        
+        // Explicitly exit the process
+        std::process::exit(0);
     }
 
     async fn connect(&self, message_sender: Sender<(NodeId, SparseMessage)>, listener: &TcpListener) -> Vec<Option<TcpStream>> {
