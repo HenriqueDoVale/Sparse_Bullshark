@@ -15,7 +15,8 @@ impl DAG {
     }
     
     pub fn insert(&mut self, vertex: Vertex){
-        self.rounds.entry(vertex.round).or_default().push(vertex);
+        self.rounds.entry(vertex.round).or_default().push(vertex.clone());
+        self.vertices.insert(vertex.hash, self.rounds.get(&vertex.round).unwrap().last().unwrap().clone());
     }
 
     pub fn get_round(&self, round : u64) -> Option<&Vec<Vertex>> {

@@ -32,7 +32,8 @@ pub fn get_environment(args: Vec<String>) -> Result<Environment, Box<dyn Error>>
     let my_id = args[MY_NODE_ID_ARG_POS].parse::<u32>()?;
     let transaction_size = args[TRANSACTION_SIZE_ARG_POS].parse::<usize>()?;
     let n_transactions = args[N_TRANSACTIONS_ARG_POS].parse::<usize>()?;
-    let test_flag = args.iter().any(|arg| arg == "test");
+    let test_flag = false;//false no sigs true sigs
+    //let test_flag = args.iter().any(|arg| arg == "test");
     let nodes = read_nodes_from_csv(NODES_FILENAME)?;
     let my_node = nodes.iter().find(|node| node.id == my_id).ok_or("This process' node was not found")?.clone();
 

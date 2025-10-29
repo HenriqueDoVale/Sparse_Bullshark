@@ -1,6 +1,6 @@
 use std::{collections::HashMap, collections::HashSet, sync::Arc};
-use bincode::deserialize;
-use ed25519_dalek::{Keypair, PublicKey, Signature, Signer, Verifier};
+use bincode::{deserialize, serialize};
+use ed25519_dalek::{ed25519::signature, Keypair, PublicKey, Signature, Signer, Verifier};
 use log::{error, info, warn};
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -37,13 +37,16 @@ pub struct SparseBullshark {
     pub last_ordered_round: u64,
     pub ordered_anchors_stack: Vec<Vertex>,
     pub finalized_block_count: usize,
+    pub pending_vertices : HashMap<u64, Vec<(NodeId, VertexMessage)>>,
+    pub already_ordered: HashSet<VertexHash>,
+    pub total_bytes_created: u64,
 }
 
 impl SparseBullshark {
     pub fn new(environment: Environment, public_keys: HashMap<NodeId, PublicKey>, private_key: Keypair) -> Self {
         let n = environment.nodes.len();
         let f = (n.saturating_sub(1)) / 3;
-        let d = 8;
+        let d = 4; //sparse number
         let transaction_size = environment.transaction_size;
         let n_transactions = environment.n_transactions;
         let mut node = SparseBullshark {
@@ -61,9 +64,68 @@ impl SparseBullshark {
             last_ordered_round: 0,
             ordered_anchors_stack: Vec::new(),
             finalized_block_count: 0,
+            pending_vertices: HashMap::new(),
+            already_ordered : HashSet::new(),
+            total_bytes_created: 0,
+            
         };
         node.add_genesis_block();
         node
+    }
+
+    async fn process_work_loop(&mut self, dispatcher_tx: &Sender<SparseMessage>){
+        let mut progress = true;
+        while progress {
+            progress = false;
+
+            // --- 1. Try to advance the round ---
+            if self.may_advance_round() {
+                progress = true; // We are making progress
+                info!("[Node {}] Advancing to round {}", self.environment.my_node.id, self.round);
+                let new_vertex = self.create_new_vertex(self.round);
+                let my_id = self.environment.my_node.id;
+                
+                self.dag.insert(new_vertex.clone());
+                self.round += 1;
+                
+                let vertex_message = SparseMessage::Vertex(VertexMessage {
+                    sender: my_id,
+                    vertex: new_vertex.clone(),
+                });
+                
+                if dispatcher_tx.send(vertex_message).await.is_err() {
+                    error!("[Node {}] Failed to send vertex to dispatcher.", self.environment.my_node.id);
+                }
+                
+                // Since we just created a vertex, try committing it (for anchors)
+                self.try_committing(new_vertex);
+            }
+
+            // --- 2. Try to process pending vertices ---
+            // We check the *previous* round (which we may have just completed)
+            // and the *current* round (which we may have just received vertices for).
+            let rounds_to_check: [u64; 2] = [self.round.saturating_sub(1), self.round];
+
+            for r in &rounds_to_check {
+                if let Some(pending) = self.pending_vertices.remove(r) {
+                    let mut still_pending = Vec::new();
+                    for (sender_id, vm) in pending {
+                        if self.validate_vertex(&vm.vertex, vm.vertex.round, sender_id) {
+                            progress = true; // We are making progress
+                            info!("[Node {}] Pending vertex from Node {} in round {} is now VALID", self.environment.my_node.id, sender_id, vm.vertex.round);
+                            self.dag.insert(vm.vertex.clone());
+                            self.try_committing(vm.vertex.clone());
+                        } else {
+                            // Still not valid, put it back
+                            still_pending.push((sender_id, vm));
+                        }
+                    }
+                    if !still_pending.is_empty() {
+                        self.pending_vertices.insert(*r, still_pending);
+                    }
+                }
+            }
+        }
     }
 
     fn add_genesis_block(&mut self) {
@@ -97,51 +159,51 @@ impl SparseBullshark {
 
         let execution_duration = Duration::from_secs(EXECUTION_DURATION);
         let start_time = Instant::now();
+        
+        // --- START OF CORRECTIONS ---
+
+        self.process_work_loop(&dispatcher_tx).await;
+
+        // Now we start the main loop, listening for messages from peers.
         while start_time.elapsed() < execution_duration {
-            tokio::select! {
-                Some((sender_id, message)) = message_rx.recv() => {
-                    // CATCH PANIC: The bug is likely a panic inside the validation logic.
-                    // This will catch it and log it instead of crashing the node.
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        match message {
-                            SparseMessage::Vertex(vm) => {
-                                if self.validate_vertex(&vm.vertex, vm.vertex.round, vm.sender) {
-                                    info!("[Node {}] Vertex from Node {} in round {} is VALID", self.environment.my_node.id, vm.sender, vm.vertex.round);
-                                    self.dag.insert(vm.vertex.clone());
-                                    self.try_committing(vm.vertex.clone());
-                                } else {
-                                    warn!("[Node {}] Vertex from Node {} in round {} is INVALID", self.environment.my_node.id, vm.sender, vm.vertex.round);
-                                }
-                            },
-                            SparseMessage::Commit(_) => {}
-                        }
-                    }));
-                    if result.is_err() {
-                        error!("[Node {}] FATAL: PANIC during message validation from Node {}. This is the bug.", self.environment.my_node.id, sender_id);
+            if let Some((sender_id, message)) = message_rx.recv().await {
+                
+                // CATCH PANIC: This check is still good.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match message {
+                        SparseMessage::Vertex(vm) => {
+                            // We will process this vertex
+                            return Some((sender_id, vm));
+                        },
+                        SparseMessage::Commit(_) => {}
                     }
-                },
-                _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                    if self.may_advance_round() {
-                        info!("[Node {}] Advancing to round {}", self.environment.my_node.id, self.round);
-                        let new_vertex = self.create_new_vertex(self.round);
-                        self.dag.insert(new_vertex.clone());
-                        self.round += 1;
-                        let vertex_message = SparseMessage::Vertex(VertexMessage {
-                            sender: self.environment.my_node.id,
-                            vertex: new_vertex,
-                        });
-                        if dispatcher_tx.send(vertex_message).await.is_err() {
-                            error!("[Node {}] Failed to send vertex to dispatcher.", self.environment.my_node.id);
-                        }
-                    }
+                    None
+                }));
+
+                if result.is_err() {
+                     error!("[Node {}] FATAL: PANIC during message validation from Node {}. This is the bug.", self.environment.my_node.id, sender_id);
+                     continue;
                 }
+
+                if let Ok(Some((s_id, vm))) = result {
+                     // ✅ PROCESS: Handle the vertex and trigger the work loop
+                    self.handle_new_vertex_message(s_id, vm, &dispatcher_tx).await;
+                }
+
+            } else {
+                // Channel is closed, which means the simulation is ending.
+                break;
             }
         }
+        
+        // --- END OF CORRECTIONS ---
+
         info!("[Node {}] Execution finished after {} seconds.", self.environment.my_node.id, start_time.elapsed().as_secs());
         // You can add logic here to print final statistics, e.g., total blocks ordered.
+        self.print_dag_stats();
         println!("[Node {}] Final ordered round: {}", self.environment.my_node.id, self.last_ordered_round);
         println!("Blocks finalized: {}", self.finalized_block_count);
-
+        print!("Total data created: {} MB", self.total_bytes_created/(1024*1024));
         // Allow some time for final messages to flush
         tokio::time::sleep(Duration::from_secs(2)).await;
         
@@ -188,8 +250,9 @@ impl SparseBullshark {
                             let msg_sender = message_sender.clone();
                             let pks = self.public_keys.clone();
                             let my_id = self.environment.my_node.id;
+                            let test_flag = self.environment.test_flag;
                             tokio::spawn(async move {
-                                Self::handle_connection(stream, msg_sender, my_id, claimed_id, pks).await;
+                                Self::handle_connection(stream, msg_sender, my_id, claimed_id, pks,test_flag).await;
                             });
                             accepted += 1;
                         }
@@ -200,7 +263,12 @@ impl SparseBullshark {
         connections
     }
 
-    async fn handle_connection(mut stream: TcpStream, message_sender: Sender<(NodeId, SparseMessage)>, my_id: NodeId, peer_id: NodeId, public_keys: HashMap<NodeId, PublicKey>) {
+    async fn handle_connection(mut stream: TcpStream, 
+        message_sender: Sender<(NodeId, SparseMessage)>, 
+        my_id: NodeId, peer_id: NodeId, 
+        public_keys: HashMap<NodeId, PublicKey>, 
+        test_flag: bool
+    ) {
         info!("[Node {}] Listening for messages from Node {}", my_id, peer_id);
         loop {
             let mut length_bytes = [0u8; MESSAGE_BYTES_LENGTH];
@@ -212,29 +280,39 @@ impl SparseBullshark {
             if length == 0 || length > 10 * 1024 * 1024 { return; }
             let mut buffer = vec![0; length as usize];
             if stream.read_exact(&mut buffer).await.is_err() { return; }
+            let mut verified = test_flag;
             let mut sig_bytes = [0u8; 64];
             if stream.read_exact(&mut sig_bytes).await.is_err() { return; }
-
-            if let Some(pubkey) = public_keys.get(&peer_id) {
-                if let Ok(sig) = Signature::from_bytes(&sig_bytes) {
-                    if pubkey.verify(&buffer, &sig).is_ok() {
-                        if let Ok(message) = deserialize(&buffer) {
-                            if message_sender.send((peer_id, message)).await.is_err() {
-                                return;
-                            }
+            if !test_flag {
+                if let Some(pubkey) = public_keys.get(&peer_id){
+                    if let Ok(sig) = Signature::from_bytes(&sig_bytes) {
+                        if pubkey.verify(&buffer, &sig).is_ok() {
+                            verified = true;
                         }
                     }
                 }
             }
+            if verified {
+                if let Ok(message) = deserialize(&buffer) {
+                    if message_sender.send((peer_id, message)).await.is_err() {
+                        return;
+                    }
+                }
+            }
         }
-    }
+     }
 
     fn start_message_dispatcher(&self, mut dispatcher_receiver: mpsc::Receiver<SparseMessage>, mut connections: Vec<Option<TcpStream>>) {
         let private_key = self.private_key.clone();
+        let test_flag = self.environment.test_flag;
         tokio::spawn(async move {
             while let Some(message) = dispatcher_receiver.recv().await {
                 if let Ok(payload) = bincode::serialize(&message) {
-                    let signature = private_key.sign(&payload);
+                    let signature = if !test_flag {
+                        private_key.sign(&payload)
+                    }else{
+                        Signature::from_bytes(&[0u8; 64]).unwrap()
+                    };
                     let length_bytes = (payload.len() as u32).to_be_bytes();
                     
                     for stream_option in connections.iter_mut() {
@@ -248,7 +326,33 @@ impl SparseBullshark {
             }
         });
     }
+    // ✅ ADD THIS ENTIRE FUNCTION
+    /// Handles a newly received vertex message.
+    /// If valid, it's processed. If invalid due to missing parents, it's buffered.
+    async fn handle_new_vertex_message(&mut self, sender_id: NodeId, vm: VertexMessage, dispatcher_tx: &Sender<SparseMessage>) {
+        
+        // Try to validate the vertex
+        if self.validate_vertex(&vm.vertex, vm.vertex.round, sender_id) {
+            // It's valid: insert, commit, and then try to advance the protocol
+            info!("[Node {}] Vertex from Node {} in round {} is VALID", self.environment.my_node.id, sender_id, vm.vertex.round);
+            self.dag.insert(vm.vertex.clone());
+            self.try_committing(vm.vertex.clone());
+            
+            // Now, try to process any work this vertex may have unblocked
+            self.process_work_loop(dispatcher_tx).await;
 
+        } else {
+            // It's invalid. Check if it's just from the future or from our own round.
+            if vm.vertex.round >= self.round.saturating_sub(1) {
+                // Buffer it for later processing.
+                info!("[Node {}] Buffering vertex from Node {} in round {} (parents missing).", self.environment.my_node.id, sender_id, vm.vertex.round);
+                self.pending_vertices.entry(vm.vertex.round).or_default().push((sender_id, vm));
+            } else {
+                // It's from the past and still invalid, so it's truly bad.
+                warn!("[Node {}] Discarding INVALID vertex from Node {} in round {}.", self.environment.my_node.id, sender_id, vm.vertex.round);
+            }
+        }
+    }
     fn may_advance_round(&self) -> bool {
         //todo add timer see paper
         if self.round == 1 { return true; }
@@ -288,6 +392,9 @@ impl SparseBullshark {
             sample_proof,
         };
         new_vertex.hash = new_vertex.calculate_hash();
+        if let Ok(vertex_bytes) = bincode::serialize(&new_vertex){
+            self.total_bytes_created += vertex_bytes.len() as u64;
+        }  
         new_vertex
     }
 
@@ -349,5 +456,30 @@ impl SparseBullshark {
         }
 
         true
+    }
+    fn print_dag_stats(&self) {
+        info!("--- [Node {}] FINAL DAG STATS ---", self.environment.my_node.id);
+
+        // 1. Check if the 'vertices' map (used for pathfinding) has all the blocks.
+        info!("Total vertices in 'dag.vertices': {}", self.dag.vertices.len());
+
+        // 2. Check if the 'rounds' map has all the blocks.
+        let mut vertices_in_rounds = 0;
+        for round_vec in self.dag.rounds.values() {
+            vertices_in_rounds += round_vec.len();
+        }
+        info!("Total vertices in 'dag.rounds': {}", vertices_in_rounds);
+
+        // 3. Check if the 'already_ordered' set matches your final count.
+        info!("Total unique vertices in 'already_ordered': {}", self.already_ordered.len());
+        
+        // 4. Check if you left any unprocessed vertices.
+        let mut pending_count = 0;
+        for pending_vec in self.pending_vertices.values() {
+            pending_count += pending_vec.len();
+        }
+        info!("Total pending vertices (unprocessed): {}", pending_count);
+        
+        info!("--- END DAG STATS ---");
     }
 }

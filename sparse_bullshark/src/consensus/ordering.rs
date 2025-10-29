@@ -63,8 +63,6 @@ impl SparseBullshark {
     }
 
     pub fn order_history(&mut self) {
-        let mut already_ordered = HashSet::new();
-        
         while let Some(anchor) = self.ordered_anchors_stack.pop() {
             // Use a queue for a breadth-first traversal of the anchor's causal past.
             let mut to_order_queue = vec![anchor.clone()];
@@ -75,7 +73,9 @@ impl SparseBullshark {
             while head < to_order_queue.len() {
                 let current = to_order_queue[head].clone();
                 head += 1;
-                
+                if self.already_ordered.contains(&current.hash){
+                    continue;
+                }
                 for parent_hash in &current.edges {
                     if !to_order_set.contains(parent_hash) {
                         if let Some(parent) = self.dag.vertices.get(parent_hash) {
@@ -91,7 +91,7 @@ impl SparseBullshark {
             to_order_queue.sort_by(|a, b| a.hash.cmp(&b.hash));
 
             for vertex in to_order_queue {
-                if !already_ordered.contains(&vertex.hash) {
+                if !self.already_ordered.contains(&vertex.hash) {
                     info!(
                         "[Node {}] FINALIZING AND ORDERING Vertex from Node {} in round {}",
                         self.environment.my_node.id, vertex.source, vertex.round
@@ -99,7 +99,7 @@ impl SparseBullshark {
                     // This is where you would deliver the block to your application.
                     // For example: self.state_machine.execute(vertex.block);
                     self.finalized_block_count += 1;
-                    already_ordered.insert(vertex.hash.clone());
+                    self.already_ordered.insert(vertex.hash.clone());
                 }
             }
         }
