@@ -33,7 +33,14 @@ foreach ($line in $lines) {
     $allArgs = "$id $transaction_size $n_transactions"
     
     # Assuming your package and binary are named 'sparse-bullshark' based on your project structure
+   if ($IsLinux) {
+    # Use 'pwsh' on Linux
+    Start-Process "pwsh" -ArgumentList "-NoExit", "-Command", "cargo run --release --package sparse_bullshark --bin sparse_bullshark $allArgs"
+}
+else {
+    # Use 'powershell.exe' on Windows
     Start-Process "powershell.exe" -ArgumentList "-NoExit", "-Command", "cargo run --release --package sparse_bullshark --bin sparse_bullshark $allArgs"
+}
 }
 
 Write-Host "All nodes started."
