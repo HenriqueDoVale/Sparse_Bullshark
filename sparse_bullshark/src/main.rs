@@ -8,6 +8,7 @@ mod config;
 use std::env;
 use env_logger::Env;
 use log::{info, error};
+use consensus::bullshark::Bullshark;
 use shared::initializer::{get_environment, get_private_key, get_public_keys};
 
 use consensus::sparse_bullshark::SparseBullshark;
@@ -30,7 +31,8 @@ async fn main() {
             let private_key = get_private_key(env.my_node.id);
 
             // Create node instance
-            let mut node = SparseBullshark::new(env, public_keys, private_key);
+            let mut node = Bullshark::new(env, public_keys, private_key);
+            //let mut node = SparseBullshark::new(env, public_keys, private_key);
             
             node.start().await;
         }
