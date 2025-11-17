@@ -7,7 +7,7 @@ mod config;
 
 use std::env;
 use env_logger::Env;
-use log::{info, error};
+use log::{info, error,debug};
 use consensus::bullshark::Bullshark;
 use shared::initializer::{get_environment, get_private_key, get_public_keys};
 
@@ -20,21 +20,25 @@ async fn main() {
 
     // Read CLI args (e.g. path to env file or node ID)
     let args: Vec<String> = env::args().collect();
-
+    let protocol_mode = env::var("PROTOCOL").unwrap_or_else(|_| "sparse".to_string()).to_lowercase();
     // Load environment and crypto setup
     match get_environment(args) {
         Ok(env) => {
-            info!("Successfully read environment: {:?}", env);
+            debug!("Successfully read environment: {:?}", env);
 
             // Load public/private keys
             let public_keys = get_public_keys();
             let private_key = get_private_key(env.my_node.id);
 
-            // Create node instance
-            let  node = Bullshark::new(env, public_keys, private_key);
-            //let node = SparseBullshark::new(env, public_keys, private_key);
-            
-            node.start().await;
+            if protocol_mode == "dense" || protocol_mode == "standard" {
+                // --- Run Standard (Dense) Bullshark ---
+                let node = Bullshark::new(env, public_keys, private_key);
+                node.start().await;
+            } else {
+                // --- Run Sparse Bullshark (Default) ---
+                let node = SparseBullshark::new(env, public_keys, private_key);
+                node.start().await;
+            }
         }
         Err(err) => {
             error!("Error loading environment: {}", err);

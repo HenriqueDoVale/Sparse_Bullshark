@@ -1,6 +1,7 @@
 param (
     [int]$transaction_size,
-    [int]$n_transactions
+    [int]$n_transactions,
+    [string]$mode = "sparse" # New parameter with default value
 )
 
 # Define the path to the CSV file
@@ -15,12 +16,20 @@ if (-not (Test-Path $csvPath)) {
 # Validate required numeric parameters
 if (-not $transaction_size -or -not $n_transactions) {
     Write-Host "Error: Both -transaction_size and -n_transactions parameters are required."
-    Write-Host "Usage: .\run_sparse.ps1 -transaction_size <int> -n_transactions <int>"
+    Write-Host "Usage: .\run_sparse.ps1 -transaction_size <int> -n_transactions <int> [-mode <sparse|dense>]"
     exit 1
 }
 
 # Skip the header and read all lines
 $lines = Get-Content $csvPath | Select-Object -Skip 1
+
+Write-Host "--------------------------------------------------"
+Write-Host " 🚀 STARTING EXPERIMENT"
+Write-Host " -------------------------------------------------"
+Write-Host "   Protocol:  $mode"
+Write-Host "   Tx Size:   $transaction_size bytes"
+Write-Host "   Tx Count:  $n_transactions per block"
+Write-Host "--------------------------------------------------"
 
 foreach ($line in $lines) {
     $parts = $line -split ","
@@ -32,15 +41,18 @@ foreach ($line in $lines) {
 
     $allArgs = "$id $transaction_size $n_transactions"
     
-    # Assuming your package and binary are named 'sparse-bullshark' based on your project structure
-   if ($IsLinux) {
-    # Use 'pwsh' on Linux
-    Start-Process "pwsh" -ArgumentList "-NoExit", "-Command", "cargo run --release --package sparse_bullshark --bin sparse_bullshark $allArgs"
-}
-else {
-    # Use 'powershell.exe' on Windows
-    Start-Process "powershell.exe" -ArgumentList "-NoExit", "-Command", "cargo run --release --package sparse_bullshark --bin sparse_bullshark $allArgs"
-}
+    # We construct a command that sets the env var *inside* the new shell, then runs cargo.
+    # Note the backtick ` before $env:PROTOCOL to prevent the current shell from expanding it.
+    $commandString = "`$env:PROTOCOL='$mode'; cargo run --release --package sparse_bullshark --bin sparse_bullshark $allArgs"
+
+    if ($IsLinux) {
+        # Use 'pwsh' on Linux
+        Start-Process "pwsh" -ArgumentList "-NoExit", "-Command", $commandString
+    }
+    else {
+        # Use 'powershell.exe' on Windows
+        Start-Process "powershell.exe" -ArgumentList "-NoExit", "-Command", $commandString
+    }
 }
 
 Write-Host "All nodes started."

@@ -1,6 +1,6 @@
 use super::bullshark::Bullshark;
 use crate::types::vertex::Vertex;
-use log::{info, warn};
+use log::{info, warn,debug};
 use std::collections::HashSet;
 impl Bullshark {
 
@@ -30,7 +30,7 @@ impl Bullshark {
         }
         let direct_commit_threshold = self.f+1;
         if vote_count >= direct_commit_threshold{
-            info!(
+            debug!(
                 "[Node {}] DIRECT COMMIT of anchor in round {}",
                 self.environment.my_node.id, anchor.round
             );
@@ -45,7 +45,7 @@ impl Bullshark {
         while r > self.last_ordered_round {
             if let Some(prev_anchor) = self.get_anchor(r).cloned()  {
                 if self.dag.has_path(&current_anchor, &prev_anchor) {
-                    info!(
+                    debug!(
                         "[Node {}] INDIRECT COMMIT of anchor in round {}",
                         self.environment.my_node.id, prev_anchor.round
                     );
@@ -92,7 +92,7 @@ impl Bullshark {
 
             for vertex in to_order_queue {
                 if !self.already_ordered.contains(&vertex.hash) {
-                    info!(
+                    debug!(
                         "[Node {}] FINALIZING AND ORDERING Vertex from Node {} in round {}",
                         self.environment.my_node.id, vertex.source, vertex.round
                     );
