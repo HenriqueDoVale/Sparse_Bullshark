@@ -37,6 +37,10 @@ pub struct Bullshark {
     pub pending_vertices : HashMap<u64, Vec<(NodeId, VertexMessage)>>,
     pub already_ordered: HashSet<VertexHash>,
     pub total_bytes_created: u64,
+    pub echo_counts : HashMap<VertexHash, HashSet<NodeId>>,
+    pub ready_counts: HashMap<VertexHash, HashSet<NodeId>>,
+    pub delivered_vertices: HashSet<VertexHash>,
+    pub pending_rbc_vertices: HashMap<VertexHash, Vertex>,
 }
 
 impl Bullshark {
@@ -62,6 +66,10 @@ impl Bullshark {
             pending_vertices: HashMap::new(),
             already_ordered : HashSet::new(),
             total_bytes_created: 0,
+            echo_counts : HashMap::new(),
+            ready_counts : HashMap::new(),
+            delivered_vertices : HashSet::new(),
+            pending_rbc_vertices : HashMap::new(),
             
         };
         node.add_genesis_block();
@@ -91,9 +99,7 @@ impl Bullshark {
                 if dispatcher_tx.send(vertex_message).await.is_err() {
                     error!("[Node {}] Failed to send vertex to dispatcher.", self.environment.my_node.id);
                 }
-                
-                // Since we just created a vertex, try committing it (for anchors)
-                self.try_committing(new_vertex);
+                self.handle_rbc_val(my_id, new_vertex.clone(), dispatcher_tx).await;
             }
 
             // --- 2. Try to process pending vertices ---
@@ -163,30 +169,36 @@ impl Bullshark {
         while start_time.elapsed() < execution_duration {
             if let Some((sender_id, message)) = message_rx.recv().await {
                 
-                // CATCH PANIC: This check is still good.
+                // Catch panics to prevent node crash on bad messages
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    match message {
-                        SparseMessage::Vertex(vm) => {
-                            // We will process this vertex
-                            return Some((sender_id, vm));
-                        },
-                        SparseMessage::Commit(_) => {}
-                    }
-                    None
+                     // Just return the message to process it outside the closure to allow async
+                     message 
                 }));
 
-                if result.is_err() {
-                     error!("[Node {}] FATAL: PANIC during message validation from Node {}. This is the bug.", self.environment.my_node.id, sender_id);
-                     continue;
-                }
-
-                if let Ok(Some((s_id, vm))) = result {
-                     // ✅ PROCESS: Handle the vertex and trigger the work loop
-                    self.handle_new_vertex_message(s_id, vm, &dispatcher_tx).await;
+                match result {
+                    Ok(msg) => {
+                        match msg {
+                            SparseMessage::Vertex(vm) => {
+                                // This acts as the RBC VAL message
+                                self.handle_rbc_val(sender_id, vm.vertex, &dispatcher_tx).await;
+                            },
+                            SparseMessage::RBC_Echo(echo) => {
+                                self.handle_rbc_echo(sender_id, echo.vertex_hash, &dispatcher_tx).await;
+                            },
+                            SparseMessage::RBC_Ready(ready) => {
+                                self.handle_rbc_ready(sender_id, ready.vertex_hash, &dispatcher_tx).await;
+                            },
+                            SparseMessage::Commit(_) => {
+                                // Handle commits if you use them
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        error!("[Node {}] FATAL: Panic processing message from Node {}", self.environment.my_node.id, sender_id);
+                    }
                 }
 
             } else {
-                // Channel is closed, which means the simulation is ending.
                 break;
             }
         }
@@ -430,6 +442,100 @@ impl Bullshark {
         }
 
         true
+    }
+    async fn broadcast(&self, msg: SparseMessage, dispatcher_tx: &Sender<SparseMessage>){
+        if let Err(e) = dispatcher_tx.send(msg).await{
+           error!("[Node {}] Failed to broadcast message: channel closed", self.environment.my_node.id);
+        }
+
+    }
+
+    async fn handle_rbc_val(&mut self, sender: NodeId, vertex :Vertex, dispatcher_tx: &Sender<SparseMessage>){
+        let hash = vertex.hash.clone();
+        let hash = vertex.hash.clone();
+        
+        if self.delivered_vertices.contains(&hash) {
+            return; 
+        }
+        if !self.pending_rbc_vertices.contains_key(&hash) {
+            // Perform basic validation before storing/voting (e.g. signature, format)
+            // Note: We don't check graph parents yet, just the vertex integrity.
+            self.pending_rbc_vertices.insert(hash.clone(), vertex);
+
+            // 2. Broadcast ECHO
+            // In Bracha's RBC, receiving a valid VAL triggers an ECHO.
+            let echo_msg = SparseMessage::RBC_Echo(crate::network::message::EchoMessage {
+                vertex_hash: hash,
+            });
+            self.broadcast(echo_msg, dispatcher_tx).await;
+        }
+    }
+    async fn handle_rbc_echo(&mut self, sender: NodeId, hash: VertexHash, dispatcher_tx: &Sender<SparseMessage>) {
+        if self.delivered_vertices.contains(&hash) {
+            return;
+        }
+
+        let votes = self.echo_counts.entry(hash.clone()).or_default();
+        votes.insert(sender);
+
+        // Threshold to send READY: 2f + 1 ECHOs (Standard Bracha)
+        // Or n - f (Quorum). We use 2f+1 here as it is standard for asynchronous BFT.
+        let threshold = 2 * self.f + 1;
+        
+        if votes.len() >= threshold {
+            self.try_send_ready(hash, dispatcher_tx).await;
+        }
+    }
+
+    async fn handle_rbc_ready(&mut self, sender: NodeId, hash: VertexHash, dispatcher_tx: &Sender<SparseMessage>) {
+        let votes = self.ready_counts.entry(hash.clone()).or_default();
+        votes.insert(sender);
+
+        let ready_count = votes.len();
+
+        // 1. Amplification Step: If we see f+1 READYs, we must also send READY
+        // This ensures liveness if correct nodes are split.
+        if ready_count >= self.f + 1 {
+            self.try_send_ready(hash.clone(), dispatcher_tx).await;
+        }
+
+        // 2. Delivery Step: If we see 2f+1 READYs, we deliver.
+        let delivery_threshold = 2 * self.f + 1;
+        if ready_count >= delivery_threshold && !self.delivered_vertices.contains(&hash) {
+            // Check if we have the body
+            if let Some(vertex) = self.pending_rbc_vertices.remove(&hash) {
+                info!("[Node {}] RBC DELIVERED vertex from Node {} in round {}", self.environment.my_node.id, vertex.source, vertex.round);
+                
+                // Mark as delivered so we don't process it again
+                self.echo_counts.remove(&hash);
+                self.ready_counts.remove(&hash);                
+                self.delivered_vertices.insert(hash);
+
+                // NOW we enter the DAG logic
+                self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }, dispatcher_tx).await;
+            } else {
+                // We have the votes but not the body (we missed the VAL).
+                // In a full implementation, we would fetch it here.
+                // For now, we wait (or log a warning).
+                warn!("[Node {}] RBC ready to deliver but missing vertex body for hash {:?}", self.environment.my_node.id, hash);
+            }
+        }
+
+    }
+    // Helper to send READY ensuring we only send it once per hash
+    async fn try_send_ready(&mut self, hash: VertexHash, dispatcher_tx: &Sender<SparseMessage>) {
+        // We use a special marker in ready_counts (e.g., our own ID) or a separate set to know if we sent it.
+        // For simplicity, let's assume we store our own vote in ready_counts when we send.
+        let my_id = self.environment.my_node.id;
+        let votes = self.ready_counts.entry(hash.clone()).or_default();
+        
+        if !votes.contains(&my_id) {
+            votes.insert(my_id);
+            let ready_msg = SparseMessage::RBC_Ready(crate::network::message::ReadyMessage {
+                vertex_hash: hash,
+            });
+            self.broadcast(ready_msg, dispatcher_tx).await;
+        }
     }
     fn print_dag_stats(&self) {
         info!("--- [Node {}] FINAL DAG STATS ---", self.environment.my_node.id);
