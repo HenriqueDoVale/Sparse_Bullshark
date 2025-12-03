@@ -203,6 +203,7 @@ impl SparseBullshark {
                         error!("[Node {}] FATAL: Panic processing message from Node {}", self.environment.my_node.id, sender_id);
                     }
                 }
+                self.process_work_loop(&dispatcher_tx).await;
 
             } else {
                 break;
@@ -364,21 +365,63 @@ impl SparseBullshark {
     fn start_message_dispatcher(&self, mut dispatcher_receiver: mpsc::Receiver<SparseMessage>, mut connections: Vec<Option<TcpStream>>) {
         let private_key = self.private_key.clone();
         let test_flag = self.environment.test_flag;
+
+        // 1. Create a channel for each active connection
+        // We will send bytes to these channels, and dedicated tasks will write to the sockets.
+        let mut peer_senders = Vec::new();
+
+        for (id, stream_option) in connections.into_iter().enumerate() {
+            if let Some(mut stream) = stream_option {
+                // Create a channel for this specific peer
+                // Capacity 1000 means we can buffer 1000 messages before slowing down
+                let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1000);
+                peer_senders.push(Some(tx));
+
+                // Spawn the dedicated Writer Task for this peer
+                tokio::spawn(async move {
+                    while let Some(data) = rx.recv().await {
+                        // Write the data to the TCP stream
+                        // If writing fails, the peer disconnected. We stop the task.
+                        if stream.write_all(&data).await.is_err() {
+                            // Ideally log here: "Writer task for Node {id} failed"
+                            break; 
+                        }
+                    }
+                });
+            } else {
+                peer_senders.push(None);
+            }
+        }
+
+        // 2. Main Dispatcher Loop
         tokio::spawn(async move {
             while let Some(message) = dispatcher_receiver.recv().await {
+                // Serialize ONCE
                 if let Ok(payload) = bincode::serialize(&message) {
+                    
+                    // Sign ONCE
                     let signature = if !test_flag {
                         private_key.sign(&payload)
-                    }else{
+                    } else {
                         Signature::from_bytes(&[0u8; 64]).unwrap()
                     };
+
+                    // Prepare the full frame ONCE
                     let length_bytes = (payload.len() as u32).to_be_bytes();
                     
-                    for stream_option in connections.iter_mut() {
-                        if let Some(stream) = stream_option {
-                            if stream.write_all(&length_bytes).await.is_err() { continue; }
-                            if stream.write_all(&payload).await.is_err() { continue; }
-                            if stream.write_all(signature.as_ref()).await.is_err() { continue; }
+                    // Combine into one buffer to send to the writer tasks
+                    // [Length (4) + Payload (N) + Signature (64)]
+                    let mut frame = Vec::with_capacity(4 + payload.len() + 64);
+                    frame.extend_from_slice(&length_bytes);
+                    frame.extend_from_slice(&payload);
+                    frame.extend_from_slice(signature.as_ref());
+
+                    // 3. Send to all writer tasks instantly
+                    for tx in peer_senders.iter() {
+                        if let Some(sender) = tx {
+                            // This clone is cheap (just copying bytes in memory)
+                            // compared to waiting for network I/O.
+                            let _ = sender.send(frame.clone()).await;
                         }
                     }
                 }
@@ -396,9 +439,6 @@ impl SparseBullshark {
             info!("[Node {}] Vertex from Node {} in round {} is VALID", self.environment.my_node.id, sender_id, vm.vertex.round);
             self.dag.insert(vm.vertex.clone());
             self.try_committing(vm.vertex.clone());
-            
-            // Now, try to process any work this vertex may have unblocked
-            self.process_work_loop(dispatcher_tx).await;
 
         } else {
             // It's invalid. Check if it's just from the future or from our own round.
@@ -523,24 +563,37 @@ impl SparseBullshark {
 
     }
 
-    async fn handle_rbc_val(&mut self, sender: NodeId, vertex :Vertex, dispatcher_tx: &Sender<SparseMessage>){
-        let hash = vertex.hash.clone();
+    async fn handle_rbc_val(&mut self, sender: NodeId, vertex: Vertex, dispatcher_tx: &Sender<SparseMessage>) {
         let hash = vertex.hash.clone();
         
         if self.delivered_vertices.contains(&hash) {
             return; 
         }
-        if !self.pending_rbc_vertices.contains_key(&hash) {
-            // Perform basic validation before storing/voting (e.g. signature, format)
-            // Note: We don't check graph parents yet, just the vertex integrity.
-            self.pending_rbc_vertices.insert(hash.clone(), vertex);
 
-            // 2. Broadcast ECHO
-            // In Bracha's RBC, receiving a valid VAL triggers an ECHO.
+        if !self.pending_rbc_vertices.contains_key(&hash) {
+            self.pending_rbc_vertices.insert(hash.clone(), vertex.clone()); // Insert first
+
+            // 1. Broadcast ECHO (Standard Logic)
             let echo_msg = SparseMessage::RBC_Echo(crate::network::message::EchoMessage {
-                vertex_hash: hash,
+                vertex_hash: hash.clone(),
             });
             self.broadcast(echo_msg, dispatcher_tx).await;
+
+            // ✅ FIX: Check if we ALREADY have enough READY votes to deliver immediately
+            let ready_count = self.ready_counts.get(&hash).map(|s| s.len()).unwrap_or(0);
+            let delivery_threshold = 2 * self.f + 1;
+
+            if ready_count >= delivery_threshold {
+                info!("[Node {}] RBC LATE DELIVERY: Body arrived after consensus for round {}", self.environment.my_node.id, vertex.round);
+                
+                // Perform delivery logic
+                self.delivered_vertices.insert(hash.clone());
+                self.echo_counts.remove(&hash);
+                self.ready_counts.remove(&hash);
+                self.pending_rbc_vertices.remove(&hash); // Remove from pending since we are delivering
+
+                self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }, dispatcher_tx).await;
+            }
         }
     }
     async fn handle_rbc_echo(&mut self, sender: NodeId, hash: VertexHash, dispatcher_tx: &Sender<SparseMessage>) {
