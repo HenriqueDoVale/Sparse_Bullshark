@@ -24,7 +24,7 @@ async fn main() {
     // Load environment and crypto setup
     match get_environment(args) {
         Ok(env) => {
-            debug!("Successfully read environment: {:?}", env);
+            info!("Successfully read environment: {:?}", env);
 
             // Load public/private keys
             let public_keys = get_public_keys();

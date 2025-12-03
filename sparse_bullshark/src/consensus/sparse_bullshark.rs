@@ -225,37 +225,69 @@ impl SparseBullshark {
     }
 
     async fn connect(&self, message_sender: Sender<(NodeId, SparseMessage)>, listener: &TcpListener) -> Vec<Option<TcpStream>> {
-        let mut connections = Vec::with_capacity(self.environment.nodes.len());
-        for _ in 0..self.environment.nodes.len() {
-            connections.push(None);
-        }
+        let n_nodes = self.environment.nodes.len();
+        let my_id = self.environment.my_node.id;
+        
+        let mut connections = Vec::with_capacity(n_nodes);
+        for _ in 0..n_nodes { connections.push(None); }
 
+        // 1. OUTGOING Connections (Background Retry Loop)
+        let mut outgoing_tasks = Vec::new();
         for node in &self.environment.nodes {
-            if node.id == self.environment.my_node.id {
-                continue;
-            }
+            if node.id == my_id { continue; }
+            let target_id = node.id;
             let address = format!("{}:{}", node.host, node.port);
-            if let Ok(mut stream) = TcpStream::connect(&address).await {
-                let nonce = generate_nonce();
-                let signature = self.private_key.sign(&nonce);
-                stream.write_all(&self.environment.my_node.id.to_be_bytes()).await.unwrap();
-                stream.write_all(&nonce).await.unwrap();
-                stream.write_all(signature.as_ref()).await.unwrap();
-                stream.flush().await.unwrap();
-                connections[node.id as usize] = Some(stream);
-            }
+            let my_id = my_id;
+            let private_key = self.private_key.clone();
+
+            let task = tokio::spawn(async move {
+                loop {
+                    if let Ok(mut stream) = TcpStream::connect(&address).await {
+                        let nonce = generate_nonce();
+                        let signature = private_key.sign(&nonce);
+                        
+                        if stream.write_all(&my_id.to_be_bytes()).await.is_err() { 
+                            sleep(Duration::from_millis(500)).await; continue; 
+                        }
+                        if stream.write_all(&nonce).await.is_err() { 
+                            sleep(Duration::from_millis(500)).await; continue; 
+                        }
+                        if stream.write_all(signature.as_ref()).await.is_err() { 
+                            sleep(Duration::from_millis(500)).await; continue; 
+                        }
+                        return (target_id, Some(stream));
+                    }
+                    sleep(Duration::from_millis(500)).await;
+                }
+            });
+            outgoing_tasks.push(task);
         }
 
+        // 2. INCOMING Connections (Main Thread)
         let mut accepted = 0;
-        while accepted < self.environment.nodes.len() - 1 {
-            if let Ok((mut stream, _)) = listener.accept().await {
+        let expected_peers = n_nodes - 1;
+        info!("[Node {}] Waiting for {} connections...", my_id, expected_peers);
+
+        while accepted < expected_peers {
+            // Log the incoming connection attempt
+            if let Ok((mut stream, addr)) = listener.accept().await {
                 let mut id_buf = [0u8; 4];
-                if stream.read_exact(&mut id_buf).await.is_err() { continue; }
+                if stream.read_exact(&mut id_buf).await.is_err() { 
+                    warn!("[Node {}] Handshake failed: could not read ID from {}. Dropping.", my_id, addr);
+                    continue; 
+                }
                 let claimed_id = u32::from_be_bytes(id_buf);
+                
                 let mut nonce = vec![0u8; NONCE_BYTES_LENGTH];
-                if stream.read_exact(&mut nonce).await.is_err() { continue; }
+                if stream.read_exact(&mut nonce).await.is_err() { 
+                    warn!("[Node {}] Handshake failed: could not read nonce from Node {}. Dropping.", my_id, claimed_id);
+                    continue; 
+                }
                 let mut sig_bytes = vec![0u8; SIGNATURE_BYTES_LENGTH];
-                if stream.read_exact(&mut sig_bytes).await.is_err() { continue; }
+                if stream.read_exact(&mut sig_bytes).await.is_err() { 
+                    warn!("[Node {}] Handshake failed: could not read signature from Node {}. Dropping.", my_id, claimed_id);
+                    continue; 
+                }
 
                 if let Some(key) = self.public_keys.get(&claimed_id) {
                     if let Ok(signature) = Signature::from_bytes(&sig_bytes) {
@@ -265,13 +297,27 @@ impl SparseBullshark {
                             let my_id = self.environment.my_node.id;
                             let test_flag = self.environment.test_flag;
                             tokio::spawn(async move {
-                                Self::handle_connection(stream, msg_sender, my_id, claimed_id, pks,test_flag).await;
+                                Self::handle_connection(stream, msg_sender, my_id, claimed_id, pks, test_flag).await;
                             });
                             accepted += 1;
+                            info!("[Node {}] Accepted connection from Node {} ({}/{})", my_id, claimed_id, accepted, expected_peers);
+                        } else {
+                            // ✅ LOG SIGNATURE FAILURE
+                            warn!("[Node {}] Handshake failed: INVALID SIGNATURE from Node {}. Dropping.", my_id, claimed_id);
                         }
+                    } else {
+                        warn!("[Node {}] Handshake failed: Malformed signature bytes from Node {}.", my_id, claimed_id);
                     }
+                } else {
+                    // ✅ LOG UNKNOWN ID FAILURE
+                    warn!("[Node {}] Handshake failed: Unknown Node ID {} (Not in public keys). Dropping.", my_id, claimed_id);
                 }
             }
+        }
+
+        for task in outgoing_tasks {
+            let (id, stream) = task.await.unwrap();
+            connections[id as usize] = stream;
         }
         connections
     }
