@@ -90,7 +90,7 @@ impl SparseBullshark {
             // --- 1. Try to advance the round ---
             if self.may_advance_round() {
                 progress = true; // We are making progress
-                info!("[Node {}] Advancing to round {}", self.environment.my_node.id, self.round);
+                debug!("[Node {}] Advancing to round {}", self.environment.my_node.id, self.round);
                 let new_vertex = self.create_new_vertex(self.round);
                 let my_id = self.environment.my_node.id;
                 
@@ -119,7 +119,7 @@ impl SparseBullshark {
                     for (sender_id, vm) in pending {
                         if self.validate_vertex(&vm.vertex, vm.vertex.round, sender_id) {
                             progress = true; // We are making progress
-                            info!("[Node {}] Pending vertex from Node {} in round {} is now VALID", self.environment.my_node.id, sender_id, vm.vertex.round);
+                            debug!("[Node {}] Pending vertex from Node {} in round {} is now VALID", self.environment.my_node.id, sender_id, vm.vertex.round);
                             self.dag.insert(vm.vertex.clone());
                             self.try_committing(vm.vertex.clone());
                         } else {
@@ -152,15 +152,15 @@ impl SparseBullshark {
         let address = format!("{}:{}", self.environment.my_node.host, self.environment.my_node.port);
         let listener = TcpListener::bind(&address).await.expect("Failed to bind local port");
 
-        info!("[Node {}] Listening on {}", self.environment.my_node.id, &address);
+        debug!("[Node {}] Listening on {}", self.environment.my_node.id, &address);
         let (message_tx, mut message_rx) = mpsc::channel(MESSAGE_CHANNEL_SIZE);
         let (dispatcher_tx, dispatcher_rx) = mpsc::channel(MESSAGE_CHANNEL_SIZE);
 
-        info!("[Node {}] Waiting for all nodes to connect...", self.environment.my_node.id);
+        debug!("[Node {}] Waiting for all nodes to connect...", self.environment.my_node.id);
         sleep(Duration::from_secs(SOCKET_BINDING_DELAY)).await;
 
         let connections = self.connect(message_tx.clone(), &listener).await;
-        info!("[Node {}] All nodes connected. Starting protocol.", self.environment.my_node.id);
+        debug!("[Node {}] All nodes connected. Starting protocol.", self.environment.my_node.id);
 
         self.start_message_dispatcher(dispatcher_rx, connections);
 
@@ -212,7 +212,7 @@ impl SparseBullshark {
  
         // --- END OF CORRECTIONS ---
 
-        info!("[Node {}] Execution finished after {} seconds.", self.environment.my_node.id, start_time.elapsed().as_secs());
+        debug!("[Node {}] Execution finished after {} seconds.", self.environment.my_node.id, start_time.elapsed().as_secs());
         // You can add logic here to print final statistics, e.g., total blocks ordered.
         self.print_dag_stats();
         println!("[Node {}] Final ordered round: {}", self.environment.my_node.id, self.last_ordered_round);
@@ -267,7 +267,7 @@ impl SparseBullshark {
         // 2. INCOMING Connections (Main Thread)
         let mut accepted = 0;
         let expected_peers = n_nodes - 1;
-        info!("[Node {}] Waiting for {} connections...", my_id, expected_peers);
+        debug!("[Node {}] Waiting for {} connections...", my_id, expected_peers);
 
         while accepted < expected_peers {
             // Log the incoming connection attempt
@@ -301,7 +301,7 @@ impl SparseBullshark {
                                 Self::handle_connection(stream, msg_sender, my_id, claimed_id, pks, test_flag).await;
                             });
                             accepted += 1;
-                            info!("[Node {}] Accepted connection from Node {} ({}/{})", my_id, claimed_id, accepted, expected_peers);
+                            debug!("[Node {}] Accepted connection from Node {} ({}/{})", my_id, claimed_id, accepted, expected_peers);
                         } else {
                             // ✅ LOG SIGNATURE FAILURE
                             warn!("[Node {}] Handshake failed: INVALID SIGNATURE from Node {}. Dropping.", my_id, claimed_id);
@@ -329,7 +329,7 @@ impl SparseBullshark {
         public_keys: HashMap<NodeId, PublicKey>, 
         test_flag: bool
     ) {
-        info!("[Node {}] Listening for messages from Node {}", my_id, peer_id);
+        debug!("[Node {}] Listening for messages from Node {}", my_id, peer_id);
         loop {
             let mut length_bytes = [0u8; MESSAGE_BYTES_LENGTH];
             if stream.read_exact(&mut length_bytes).await.is_err() {
@@ -436,7 +436,7 @@ impl SparseBullshark {
         // Try to validate the vertex
         if self.validate_vertex(&vm.vertex, vm.vertex.round, sender_id) {
             // It's valid: insert, commit, and then try to advance the protocol
-            info!("[Node {}] Vertex from Node {} in round {} is VALID", self.environment.my_node.id, sender_id, vm.vertex.round);
+            debug!("[Node {}] Vertex from Node {} in round {} is VALID", self.environment.my_node.id, sender_id, vm.vertex.round);
             self.dag.insert(vm.vertex.clone());
             self.try_committing(vm.vertex.clone());
 
@@ -444,7 +444,7 @@ impl SparseBullshark {
             // It's invalid. Check if it's just from the future or from our own round.
             if vm.vertex.round >= self.round.saturating_sub(1) {
                 // Buffer it for later processing.
-                info!("[Node {}] Buffering vertex from Node {} in round {} (parents missing).", self.environment.my_node.id, sender_id, vm.vertex.round);
+                debug!("[Node {}] Buffering vertex from Node {} in round {} (parents missing).", self.environment.my_node.id, sender_id, vm.vertex.round);
                 self.pending_vertices.entry(vm.vertex.round).or_default().push((sender_id, vm));
             } else {
                 // It's from the past and still invalid, so it's truly bad.
@@ -630,7 +630,7 @@ impl SparseBullshark {
         if ready_count >= delivery_threshold && !self.delivered_vertices.contains(&hash) {
             // Check if we have the body
             if let Some(vertex) = self.pending_rbc_vertices.remove(&hash) {
-                info!("[Node {}] RBC DELIVERED vertex from Node {} in round {}", self.environment.my_node.id, vertex.source, vertex.round);
+                debug!("[Node {}] RBC DELIVERED vertex from Node {} in round {}", self.environment.my_node.id, vertex.source, vertex.round);
                 
                 // Mark as delivered so we don't process it again
                 self.echo_counts.remove(&hash);
@@ -665,28 +665,28 @@ impl SparseBullshark {
     }
     
     fn print_dag_stats(&self) {
-        info!("--- [Node {}] FINAL DAG STATS ---", self.environment.my_node.id);
+        debug!("--- [Node {}] FINAL DAG STATS ---", self.environment.my_node.id);
 
         // 1. Check if the 'vertices' map (used for pathfinding) has all the blocks.
-        info!("Total vertices in 'dag.vertices': {}", self.dag.vertices.len());
+        debug!("Total vertices in 'dag.vertices': {}", self.dag.vertices.len());
 
         // 2. Check if the 'rounds' map has all the blocks.
         let mut vertices_in_rounds = 0;
         for round_vec in self.dag.rounds.values() {
             vertices_in_rounds += round_vec.len();
         }
-        info!("Total vertices in 'dag.rounds': {}", vertices_in_rounds);
+        debug!("Total vertices in 'dag.rounds': {}", vertices_in_rounds);
 
         // 3. Check if the 'already_ordered' set matches your final count.
-        info!("Total unique vertices in 'already_ordered': {}", self.already_ordered.len());
+        debug!("Total unique vertices in 'already_ordered': {}", self.already_ordered.len());
         
         // 4. Check if you left any unprocessed vertices.
         let mut pending_count = 0;
         for pending_vec in self.pending_vertices.values() {
             pending_count += pending_vec.len();
         }
-        info!("Total pending vertices (unprocessed): {}", pending_count);
+        debug!("Total pending vertices (unprocessed): {}", pending_count);
         
-        info!("--- END DAG STATS ---");
+        debug!("--- END DAG STATS ---");
     }
 }
