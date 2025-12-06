@@ -51,7 +51,7 @@ impl SparseBullshark {
     pub fn new(environment: Environment, public_keys: HashMap<NodeId, PublicKey>, private_key: Keypair) -> Self {
         let n = environment.nodes.len();
         let f = (n.saturating_sub(1)) / 3;
-        let d = 5; //sparse number
+        let d = n/2; //sparse number
         let transaction_size = environment.transaction_size;
         let n_transactions = environment.n_transactions;
         let mut node = SparseBullshark {
