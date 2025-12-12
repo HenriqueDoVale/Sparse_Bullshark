@@ -144,6 +144,8 @@ impl SparseBullshark {
             edges: vec![],
             signed_round: vec![],
             sample_proof: vec![],
+            tc : None,
+            nvc : None,
         };
         self.dag.insert(genesis_vertex);
     }
@@ -196,6 +198,9 @@ impl SparseBullshark {
                             },
                             SparseMessage::Commit(_) => {
                                 // Handle commits if you use them
+                            }
+                            SparseMessage::Timeout(_)=>{
+                                
                             }
                         }
                     }
@@ -489,6 +494,8 @@ impl SparseBullshark {
             edges: edges_hashes,
             signed_round: signature.to_bytes().to_vec(),
             sample_proof,
+            tc : None,
+            nvc : None,
         };
         new_vertex.hash = new_vertex.calculate_hash();
         if let Ok(vertex_bytes) = bincode::serialize(&new_vertex){

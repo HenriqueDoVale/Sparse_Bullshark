@@ -24,6 +24,11 @@ pub struct EchoMessage {
 pub struct ReadyMessage {
     pub vertex_hash : VertexHash,
 }
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TimeoutMessage {
+    pub round: u64,
+    pub signature: Vec<u8>,
+}
 
 /// Unified network message type for Sparse Bullshark.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -31,5 +36,6 @@ pub enum SparseMessage {
     Vertex(VertexMessage),
     RBC_Echo(EchoMessage),
     RBC_Ready(ReadyMessage),
+    Timeout(TimeoutMessage),
     Commit(CommitMessage),
 }

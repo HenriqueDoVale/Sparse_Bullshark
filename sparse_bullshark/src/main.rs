@@ -13,6 +13,8 @@ use shared::initializer::{get_environment, get_private_key, get_public_keys};
 
 use consensus::sparse_bullshark::SparseBullshark;
 
+use crate::consensus::sailfish::Sailfish;
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     // Initialize the logger
@@ -30,12 +32,14 @@ async fn main() {
             let public_keys = get_public_keys();
             let private_key = get_private_key(env.my_node.id);
 
-            if protocol_mode == "dense" || protocol_mode == "standard" {
+            if protocol_mode == "dense" {
                 // --- Run Standard (Dense) Bullshark ---
                 let node = Bullshark::new(env, public_keys, private_key);
                 node.start().await;
+            } else if protocol_mode == "sailfish "{
+                let node = Sailfish::new(env,public_keys,private_key);
+                node.start().await;
             } else {
-                // --- Run Sparse Bullshark (Default) ---
                 let node = SparseBullshark::new(env, public_keys, private_key);
                 node.start().await;
             }
