@@ -21,7 +21,7 @@ const SIGNATURE_BYTES_LENGTH: usize = 64;
 const MESSAGE_CHANNEL_SIZE: usize = 1024;
 const SOCKET_BINDING_DELAY: u64 = 2;
 const MESSAGE_BYTES_LENGTH: usize = 4;
-const EXECUTION_DURATION: u64 = 120;
+const EXECUTION_DURATION: u64 = 60;
 
 pub struct Bullshark {
     pub environment: Environment,
