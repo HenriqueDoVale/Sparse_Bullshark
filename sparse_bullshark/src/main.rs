@@ -36,7 +36,7 @@ async fn main() {
                 // --- Run Standard (Dense) Bullshark ---
                 let node = Bullshark::new(env, public_keys, private_key);
                 node.start().await;
-            } else if protocol_mode == "sailfish "{
+            } else if protocol_mode == "sailfish"{
                 let node = Sailfish::new(env,public_keys,private_key);
                 node.start().await;
             } else {

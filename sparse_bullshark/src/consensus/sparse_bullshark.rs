@@ -23,7 +23,7 @@ const SIGNATURE_BYTES_LENGTH: usize = 64;
 const MESSAGE_CHANNEL_SIZE: usize = 1024;
 const SOCKET_BINDING_DELAY: u64 = 2;
 const MESSAGE_BYTES_LENGTH: usize = 4;
-const EXECUTION_DURATION: u64 = 120;
+const EXECUTION_DURATION: u64 = 60;
 
 pub struct SparseBullshark {
     pub environment: Environment,
@@ -49,6 +49,7 @@ pub struct SparseBullshark {
 
 impl SparseBullshark {
     pub fn new(environment: Environment, public_keys: HashMap<NodeId, PublicKey>, private_key: Keypair) -> Self {
+        println!("Sparse");
         let n = environment.nodes.len();
         let f = (n.saturating_sub(1)) / 3;
         let d = n/2; //sparse number

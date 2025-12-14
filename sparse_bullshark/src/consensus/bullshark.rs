@@ -45,6 +45,7 @@ pub struct Bullshark {
 
 impl Bullshark {
     pub fn new(environment: Environment, public_keys: HashMap<NodeId, PublicKey>, private_key: Keypair) -> Self {
+        println!("Bullshark");
         let n = environment.nodes.len();
         let f = (n.saturating_sub(1)) / 3;
         let transaction_size = environment.transaction_size;
