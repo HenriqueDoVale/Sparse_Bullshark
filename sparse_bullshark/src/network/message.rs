@@ -34,8 +34,8 @@ pub struct TimeoutMessage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SparseMessage {
     Vertex(VertexMessage),
-    RBC_Echo(EchoMessage),
-    RBC_Ready(ReadyMessage),
+    RBCEcho(EchoMessage),
+    RBCReady(ReadyMessage),
     Timeout(TimeoutMessage),
     Commit(CommitMessage),
 }

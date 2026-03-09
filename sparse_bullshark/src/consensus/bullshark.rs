@@ -1,8 +1,7 @@
 use std::{collections::HashMap, collections::HashSet, sync::Arc};
-use bincode::{deserialize, serialize};
-use ed25519_dalek::{ed25519::signature, Keypair, PublicKey, Signature, Signer, Verifier};
+use bincode::{deserialize};
+use ed25519_dalek::{ Keypair, PublicKey, Signature, Signer, Verifier};
 use log::{error, info, warn, debug};
-use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -24,6 +23,7 @@ const MESSAGE_BYTES_LENGTH: usize = 4;
 const EXECUTION_DURATION: u64 = 60;
 
 pub struct Bullshark {
+    pub is_sparse: bool,
     pub environment: Environment,
     pub dag: DAG,
     pub f: usize,
@@ -51,6 +51,7 @@ impl Bullshark {
         let transaction_size = environment.transaction_size;
         let n_transactions = environment.n_transactions;
         let mut node = Bullshark {
+            is_sparse: false,
             environment,
             dag: DAG::new(),
             f,
@@ -189,10 +190,10 @@ impl Bullshark {
                                 // This acts as the RBC VAL message
                                 self.handle_rbc_val(sender_id, vm.vertex, &dispatcher_tx).await;
                             },
-                            SparseMessage::RBC_Echo(echo) => {
+                            SparseMessage::RBCEcho(echo) => {
                                 self.handle_rbc_echo(sender_id, echo.vertex_hash, &dispatcher_tx).await;
                             },
-                            SparseMessage::RBC_Ready(ready) => {
+                            SparseMessage::RBCReady(ready) => {
                                 self.handle_rbc_ready(sender_id, ready.vertex_hash, &dispatcher_tx).await;
                             },
                             SparseMessage::Commit(_) => {
@@ -365,14 +366,14 @@ impl Bullshark {
      }
 
     // ✅ UPDATED: Parallel Sender
-    fn start_message_dispatcher(&self, mut dispatcher_receiver: mpsc::Receiver<SparseMessage>, mut connections: Vec<Option<TcpStream>>) {
+    fn start_message_dispatcher(&self, mut dispatcher_receiver: mpsc::Receiver<SparseMessage>, connections: Vec<Option<TcpStream>>) {
         let private_key = self.private_key.clone();
         let test_flag = self.environment.test_flag;
 
         // 1. Create a channel for each active connection
         let mut peer_senders = Vec::new();
 
-        for (id, stream_option) in connections.into_iter().enumerate() {
+        for (_id, stream_option) in connections.into_iter().enumerate() {
             if let Some(mut stream) = stream_option {
                 let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1000);
                 peer_senders.push(Some(tx));
@@ -419,7 +420,7 @@ impl Bullshark {
     }
 
     // ✅ UPDATED: Non-recursive vertex handler (just inserts)
-    async fn handle_new_vertex_message(&mut self, sender_id: NodeId, vm: VertexMessage, dispatcher_tx: &Sender<SparseMessage>) {
+    async fn handle_new_vertex_message(&mut self, sender_id: NodeId, vm: VertexMessage) {
         if self.validate_vertex(&vm.vertex, vm.vertex.round, sender_id) {
             debug!("[Node {}] Vertex from Node {} in round {} is VALID", self.environment.my_node.id, sender_id, vm.vertex.round);
             self.dag.insert(vm.vertex.clone());
@@ -530,7 +531,7 @@ impl Bullshark {
     }
 
     // ✅ NEW: RBC Handlers adapted from SparseBullshark
-    async fn handle_rbc_val(&mut self, sender: NodeId, vertex: Vertex, dispatcher_tx: &Sender<SparseMessage>) {
+    async fn handle_rbc_val(&mut self, _sender: NodeId, vertex: Vertex, dispatcher_tx: &Sender<SparseMessage>) {
         let hash = vertex.hash.clone();
         
         if self.delivered_vertices.contains(&hash) {
@@ -540,7 +541,7 @@ impl Bullshark {
         if !self.pending_rbc_vertices.contains_key(&hash) {
             self.pending_rbc_vertices.insert(hash.clone(), vertex.clone());
 
-            let echo_msg = SparseMessage::RBC_Echo(crate::network::message::EchoMessage {
+            let echo_msg = SparseMessage::RBCEcho(crate::network::message::EchoMessage {
                 vertex_hash: hash.clone(),
             });
             self.broadcast(echo_msg, dispatcher_tx).await;
@@ -556,7 +557,7 @@ impl Bullshark {
                 self.ready_counts.remove(&hash);
                 self.pending_rbc_vertices.remove(&hash);
 
-                self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }, dispatcher_tx).await;
+                self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }).await;
             }
         }
     }
@@ -595,7 +596,7 @@ impl Bullshark {
                 self.ready_counts.remove(&hash);                
                 self.delivered_vertices.insert(hash);
 
-                self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }, dispatcher_tx).await;
+                self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }).await;
             } else {
                 warn!("[Node {}] RBC ready to deliver but missing vertex body for hash {:?}", self.environment.my_node.id, hash);
             }
@@ -608,7 +609,7 @@ impl Bullshark {
         
         if !votes.contains(&my_id) {
             votes.insert(my_id);
-            let ready_msg = SparseMessage::RBC_Ready(crate::network::message::ReadyMessage {
+            let ready_msg = SparseMessage::RBCReady(crate::network::message::ReadyMessage {
                 vertex_hash: hash,
             });
             self.broadcast(ready_msg, dispatcher_tx).await;

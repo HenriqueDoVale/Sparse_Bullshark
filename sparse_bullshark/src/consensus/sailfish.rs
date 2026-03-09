@@ -1,8 +1,7 @@
 use std::{collections::{HashMap, HashSet, BTreeMap}, sync::Arc};
-use bincode::{deserialize, serialize};
-use ed25519_dalek::{ed25519::signature, Keypair, PublicKey, Signature, Signer, Verifier};
+use bincode::{deserialize};
+use ed25519_dalek::{Keypair, PublicKey, Signature, Signer, Verifier};
 use log::{error, info, warn, debug};
-use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -263,7 +262,7 @@ impl Sailfish {
         let candidates = self.dag.get_round(prev_round).cloned().unwrap_or_default();
         
         // Link to parents (Dense style - link to all visible)
-        let mut edges: Vec<VertexHash> = candidates.iter().map(|v| v.hash.clone()).collect();
+        let edges: Vec<VertexHash> = candidates.iter().map(|v| v.hash.clone()).collect();
 
         // SAILFISH RULE:
         // "We require a round r vertex to either have a strong path to the round r-1 leader vertex OR include TC"
@@ -457,8 +456,8 @@ impl Sailfish {
                     
                     match msg {
                         SparseMessage::Vertex(v) => self.handle_rbc_val(sender, v.vertex, &dispatcher_tx).await,
-                        SparseMessage::RBC_Echo(e) => self.handle_rbc_echo(sender, e.vertex_hash, &dispatcher_tx).await,
-                        SparseMessage::RBC_Ready(r) => self.handle_rbc_ready(sender, r.vertex_hash, &dispatcher_tx).await,
+                        SparseMessage::RBCEcho(e) => self.handle_rbc_echo(sender, e.vertex_hash, &dispatcher_tx).await,
+                        SparseMessage::RBCReady(r) => self.handle_rbc_ready(sender, r.vertex_hash, &dispatcher_tx).await,
                         
                         // Handle Timeout Vote
                         SparseMessage::Timeout(t) => self.handle_timeout_vote(sender, t.round, t.signature).await,
@@ -479,7 +478,7 @@ impl Sailfish {
 
     // --- HELPERS (Copied from Bullshark/SparseBullshark) ---
     
-    async fn handle_new_vertex_message(&mut self, sender: NodeId, vm: VertexMessage, dispatcher_tx: &Sender<SparseMessage>) {
+    async fn handle_new_vertex_message(&mut self, sender: NodeId, vm: VertexMessage) {
          if self.validate_vertex(&vm.vertex, vm.vertex.round, sender) {
             self.dag.insert(vm.vertex.clone());
             self.try_committing_sailfish();
@@ -491,7 +490,7 @@ impl Sailfish {
          }
     }
     
-    async fn handle_rbc_val(&mut self, sender: NodeId, vertex: Vertex, dispatcher_tx: &Sender<SparseMessage>) {
+    async fn handle_rbc_val(&mut self, _sender: NodeId, vertex: Vertex, dispatcher_tx: &Sender<SparseMessage>) {
         let hash = vertex.hash.clone();
         
         if self.delivered_vertices.contains(&hash) {
@@ -501,7 +500,7 @@ impl Sailfish {
         if !self.pending_rbc_vertices.contains_key(&hash) {
             self.pending_rbc_vertices.insert(hash.clone(), vertex.clone());
 
-            let echo_msg = SparseMessage::RBC_Echo(crate::network::message::EchoMessage {
+            let echo_msg = SparseMessage::RBCEcho(crate::network::message::EchoMessage {
                 vertex_hash: hash.clone(),
             });
             self.broadcast(echo_msg, dispatcher_tx).await;
@@ -517,7 +516,7 @@ impl Sailfish {
                 self.ready_counts.remove(&hash);
                 self.pending_rbc_vertices.remove(&hash);
 
-                self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }, dispatcher_tx).await;
+                self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }).await;
             }
         }
     }
@@ -556,7 +555,7 @@ impl Sailfish {
                 self.ready_counts.remove(&hash);                
                 self.delivered_vertices.insert(hash);
 
-                self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }, dispatcher_tx).await;
+                self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }).await;
             } else {
                 warn!("[Node {}] RBC ready to deliver but missing vertex body for hash {:?}", self.environment.my_node.id, hash);
             }
@@ -569,7 +568,7 @@ impl Sailfish {
         
         if !votes.contains(&my_id) {
             votes.insert(my_id);
-            let ready_msg = SparseMessage::RBC_Ready(crate::network::message::ReadyMessage {
+            let ready_msg = SparseMessage::RBCReady(crate::network::message::ReadyMessage {
                 vertex_hash: hash,
             });
             self.broadcast(ready_msg, dispatcher_tx).await;
@@ -734,14 +733,14 @@ impl Sailfish {
 
 
      // ✅ UPDATED: Parallel Sender
-    fn start_message_dispatcher(&self, mut dispatcher_receiver: mpsc::Receiver<SparseMessage>, mut connections: Vec<Option<TcpStream>>) {
+    fn start_message_dispatcher(&self, mut dispatcher_receiver: mpsc::Receiver<SparseMessage>, connections: Vec<Option<TcpStream>>) {
         let private_key = self.private_key.clone();
         let test_flag = self.environment.test_flag;
 
         // 1. Create a channel for each active connection
         let mut peer_senders = Vec::new();
 
-        for (id, stream_option) in connections.into_iter().enumerate() {
+        for (_id, stream_option) in connections.into_iter().enumerate() {
             if let Some(mut stream) = stream_option {
                 let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1000);
                 peer_senders.push(Some(tx));

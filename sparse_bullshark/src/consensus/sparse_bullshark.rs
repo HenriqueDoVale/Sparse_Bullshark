@@ -1,6 +1,6 @@
 use std::{collections::HashMap, collections::HashSet, sync::Arc};
-use bincode::{deserialize, serialize};
-use ed25519_dalek::{ed25519::signature, Keypair, PublicKey, Signature, Signer, Verifier};
+use bincode::{deserialize};
+use ed25519_dalek::{ Keypair, PublicKey, Signature, Signer, Verifier};
 use log::{error, info, warn,debug};
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -191,10 +191,10 @@ impl SparseBullshark {
                                 // This acts as the RBC VAL message
                                 self.handle_rbc_val(sender_id, vm.vertex, &dispatcher_tx).await;
                             },
-                            SparseMessage::RBC_Echo(echo) => {
+                            SparseMessage::RBCEcho(echo) => {
                                 self.handle_rbc_echo(sender_id, echo.vertex_hash, &dispatcher_tx).await;
                             },
-                            SparseMessage::RBC_Ready(ready) => {
+                            SparseMessage::RBCReady(ready) => {
                                 self.handle_rbc_ready(sender_id, ready.vertex_hash, &dispatcher_tx).await;
                             },
                             SparseMessage::Commit(_) => {
@@ -368,7 +368,7 @@ impl SparseBullshark {
         }
      }
 
-    fn start_message_dispatcher(&self, mut dispatcher_receiver: mpsc::Receiver<SparseMessage>, mut connections: Vec<Option<TcpStream>>) {
+    fn start_message_dispatcher(&self, mut dispatcher_receiver: mpsc::Receiver<SparseMessage>, connections: Vec<Option<TcpStream>>) {
         let private_key = self.private_key.clone();
         let test_flag = self.environment.test_flag;
 
@@ -376,7 +376,7 @@ impl SparseBullshark {
         // We will send bytes to these channels, and dedicated tasks will write to the sockets.
         let mut peer_senders = Vec::new();
 
-        for (id, stream_option) in connections.into_iter().enumerate() {
+        for (_id, stream_option) in connections.into_iter().enumerate() {
             if let Some(mut stream) = stream_option {
                 // Create a channel for this specific peer
                 // Capacity 1000 means we can buffer 1000 messages before slowing down
@@ -437,7 +437,7 @@ impl SparseBullshark {
     // ✅ ADD THIS ENTIRE FUNCTION
     /// Handles a newly received vertex message.
     /// If valid, it's processed. If invalid due to missing parents, it's buffered.
-    async fn handle_new_vertex_message(&mut self, sender_id: NodeId, vm: VertexMessage, dispatcher_tx: &Sender<SparseMessage>) {
+    async fn handle_new_vertex_message(&mut self, sender_id: NodeId, vm: VertexMessage) {
         
         // Try to validate the vertex
         if self.validate_vertex(&vm.vertex, vm.vertex.round, sender_id) {
@@ -565,13 +565,13 @@ impl SparseBullshark {
         true
     }
     async fn broadcast(&self, msg: SparseMessage, dispatcher_tx: &Sender<SparseMessage>){
-        if let Err(e) = dispatcher_tx.send(msg).await{
+        if let Err(_e) = dispatcher_tx.send(msg).await{
            error!("[Node {}] Failed to broadcast message: channel closed", self.environment.my_node.id);
         }
 
     }
 
-    async fn handle_rbc_val(&mut self, sender: NodeId, vertex: Vertex, dispatcher_tx: &Sender<SparseMessage>) {
+    async fn handle_rbc_val(&mut self, _sender: NodeId, vertex: Vertex, dispatcher_tx: &Sender<SparseMessage>) {
         let hash = vertex.hash.clone();
         
         if self.delivered_vertices.contains(&hash) {
@@ -582,7 +582,7 @@ impl SparseBullshark {
             self.pending_rbc_vertices.insert(hash.clone(), vertex.clone()); // Insert first
 
             // 1. Broadcast ECHO (Standard Logic)
-            let echo_msg = SparseMessage::RBC_Echo(crate::network::message::EchoMessage {
+            let echo_msg = SparseMessage::RBCEcho(crate::network::message::EchoMessage {
                 vertex_hash: hash.clone(),
             });
             self.broadcast(echo_msg, dispatcher_tx).await;
@@ -600,7 +600,7 @@ impl SparseBullshark {
                 self.ready_counts.remove(&hash);
                 self.pending_rbc_vertices.remove(&hash); // Remove from pending since we are delivering
 
-                self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }, dispatcher_tx).await;
+                self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }).await;
             }
         }
     }
@@ -646,7 +646,7 @@ impl SparseBullshark {
                 self.delivered_vertices.insert(hash);
 
                 // NOW we enter the DAG logic
-                self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }, dispatcher_tx).await;
+                self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }).await;
             } else {
                 // We have the votes but not the body (we missed the VAL).
                 // In a full implementation, we would fetch it here.
@@ -665,7 +665,7 @@ impl SparseBullshark {
         
         if !votes.contains(&my_id) {
             votes.insert(my_id);
-            let ready_msg = SparseMessage::RBC_Ready(crate::network::message::ReadyMessage {
+            let ready_msg = SparseMessage::RBCReady(crate::network::message::ReadyMessage {
                 vertex_hash: hash,
             });
             self.broadcast(ready_msg, dispatcher_tx).await;

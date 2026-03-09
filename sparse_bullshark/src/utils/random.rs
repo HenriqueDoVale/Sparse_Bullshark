@@ -2,8 +2,6 @@ use crate::types::vertex::Vertex;
 use rand::{SeedableRng, seq::SliceRandom};
 use rand_chacha::ChaCha20Rng;
 
-pub type NodeId = u32;
-
 pub fn random_sample<'a>(
     candidates: &'a [Vertex],
     d: usize,

@@ -1,6 +1,6 @@
 use crate::types::vertex::{Vertex};
 use std::{collections::{HashMap, HashSet, VecDeque}};
-use crate::types::vertex::{NodeId,VertexHash};
+use crate::types::vertex::{VertexHash};
 
 pub struct DAG {
     pub rounds: HashMap<u64, Vec<Vertex>>,
@@ -22,6 +22,7 @@ impl DAG {
     pub fn get_round(&self, round : u64) -> Option<&Vec<Vertex>> {
             self.rounds.get(&round)
     }
+    /* 
     pub fn get_vertices_by_sources(&self, round: u64, sources: &[NodeId]) -> Vec<Vertex> {
         let mut result = Vec::new();
         let sources_set: HashSet<_> = sources.iter().collect();
@@ -34,6 +35,7 @@ impl DAG {
         }
         result
     }
+    */
     pub fn has_path(&self, start_vertex: &Vertex, target_vertex: &Vertex) -> bool {
        if start_vertex.hash == target_vertex.hash {
             return true;

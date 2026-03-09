@@ -7,7 +7,7 @@ mod config;
 
 use std::env;
 use env_logger::Env;
-use log::{info, error,debug};
+use log::{info, error};
 use consensus::bullshark::Bullshark;
 use shared::initializer::{get_environment, get_private_key, get_public_keys};
 

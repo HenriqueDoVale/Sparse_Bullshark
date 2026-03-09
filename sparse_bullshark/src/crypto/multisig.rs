@@ -1,4 +1,4 @@
-use ed25519_dalek::{Keypair, PublicKey, Signature, Signer, Verifier, ed25519::signature::Signature as _};
+use ed25519_dalek::{Keypair, PublicKey, Signature, Signer};
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use log::{error, warn};
