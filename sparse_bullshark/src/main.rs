@@ -9,11 +9,12 @@ use std::env;
 use env_logger::Env;
 use log::{info, error};
 use consensus::bullshark::Bullshark;
-use shared::initializer::{get_environment, get_private_key, get_public_keys};
+use shared::{domain::node::NodeBehavior, initializer::{get_environment, get_private_key, get_public_keys}};
 
 use consensus::sparse_bullshark::SparseBullshark;
 
 use crate::consensus::sailfish::Sailfish;
+use crate::consensus::prbc_sailfish::PRBCSailfish;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -28,6 +29,23 @@ async fn main() {
         Ok(env) => {
             info!("Successfully read environment: {:?}", env);
 
+            let (behavior_label, behavior_desc) = match env.my_node.behavior {
+                NodeBehavior::Ok     => ("OK",     "Normal honest node — full participation"),
+                NodeBehavior::Byz1   => ("BYZ1",   "Byzantine: sends proposal to only 2f+1 peers"),
+                NodeBehavior::Silent => ("SILENT",  "Byzantine: never creates or sends its own vertex"),
+                NodeBehavior::Byz2   => ("BYZ2",   "Byzantine: forwards fake payload (wrong body, original hash)"),
+            };
+            println!("\n\
+                ╔══════════════════════════════════════════════════════╗\n\
+                ║  NODE {:2}  |  PROTOCOL: {:12}  |  {:6}         ║\n\
+                ║  {}  ║\n\
+                ╚══════════════════════════════════════════════════════╝\n",
+                env.my_node.id,
+                protocol_mode.to_uppercase(),
+                behavior_label,
+                format!("{:<52}", behavior_desc),
+            );
+
             // Load public/private keys
             let public_keys = get_public_keys();
             let private_key = get_private_key(env.my_node.id);
@@ -36,8 +54,11 @@ async fn main() {
                 // --- Run Standard (Dense) Bullshark ---
                 let node = Bullshark::new(env, public_keys, private_key);
                 node.start().await;
-            } else if protocol_mode == "sailfish"{
-                let node = Sailfish::new(env,public_keys,private_key);
+            } else if protocol_mode == "sailfish" {
+                let node = Sailfish::new(env, public_keys, private_key);
+                node.start().await;
+            } else if protocol_mode == "prbc_sailfish" {
+                let node = PRBCSailfish::new(env, public_keys, private_key);
                 node.start().await;
             } else {
                 let node = SparseBullshark::new(env, public_keys, private_key);

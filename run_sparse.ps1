@@ -43,7 +43,7 @@ foreach ($line in $lines) {
     
     # We construct a command that sets the env var *inside* the new shell, then runs cargo.
     # Note the backtick ` before $env:PROTOCOL to prevent the current shell from expanding it.
-    $commandString = "`$env:PROTOCOL='$mode'; cargo run --release --package sparse_bullshark --bin sparse_bullshark $allArgs"
+    $commandString = "`$env:PROTOCOL='$mode'; `$env:RUST_LOG='info'; cargo run --release --package sparse_bullshark --bin sparse_bullshark $allArgs"
 
     if ($IsLinux) {
         # Use 'pwsh' on Linux

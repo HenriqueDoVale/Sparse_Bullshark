@@ -195,7 +195,7 @@ impl SparseBullshark {
                                 self.handle_rbc_echo(sender_id, echo.vertex_hash, &dispatcher_tx).await;
                             },
                             SparseMessage::RBCReady(ready) => {
-                                self.handle_rbc_ready(sender_id, ready.vertex_hash, &dispatcher_tx).await;
+                                self.handle_rbc_ready(sender_id, ready, &dispatcher_tx).await;
                             },
                             SparseMessage::Commit(_) => {
                                 // Handle commits if you use them
@@ -579,26 +579,27 @@ impl SparseBullshark {
         }
 
         if !self.pending_rbc_vertices.contains_key(&hash) {
-            self.pending_rbc_vertices.insert(hash.clone(), vertex.clone()); // Insert first
+            self.pending_rbc_vertices.insert(hash.clone(), vertex.clone());
+        }
 
-            // 1. Broadcast ECHO (Standard Logic)
+        let my_id = self.environment.my_node.id;
+        if !self.echo_counts.entry(hash.clone()).or_default().contains(&my_id) {
+            self.echo_counts.get_mut(&hash).unwrap().insert(my_id);
             let echo_msg = SparseMessage::RBCEcho(crate::network::message::EchoMessage {
                 vertex_hash: hash.clone(),
             });
             self.broadcast(echo_msg, dispatcher_tx).await;
 
-            // ✅ FIX: Check if we ALREADY have enough READY votes to deliver immediately
             let ready_count = self.ready_counts.get(&hash).map(|s| s.len()).unwrap_or(0);
             let delivery_threshold = 2 * self.f + 1;
 
             if ready_count >= delivery_threshold {
                 info!("[Node {}] RBC LATE DELIVERY: Body arrived after consensus for round {}", self.environment.my_node.id, vertex.round);
-                
-                // Perform delivery logic
+
                 self.delivered_vertices.insert(hash.clone());
                 self.echo_counts.remove(&hash);
                 self.ready_counts.remove(&hash);
-                self.pending_rbc_vertices.remove(&hash); // Remove from pending since we are delivering
+                self.pending_rbc_vertices.remove(&hash);
 
                 self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }).await;
             }
@@ -612,61 +613,57 @@ impl SparseBullshark {
         let votes = self.echo_counts.entry(hash.clone()).or_default();
         votes.insert(sender);
 
-        // Threshold to send READY: 2f + 1 ECHOs (Standard Bracha)
-        // Or n - f (Quorum). We use 2f+1 here as it is standard for asynchronous BFT.
         let threshold = 2 * self.f + 1;
-        
+
         if votes.len() >= threshold {
             self.try_send_ready(hash, dispatcher_tx).await;
         }
     }
 
-    async fn handle_rbc_ready(&mut self, sender: NodeId, hash: VertexHash, dispatcher_tx: &Sender<SparseMessage>) {
+    async fn handle_rbc_ready(&mut self, sender: NodeId, ready: crate::network::message::ReadyMessage, dispatcher_tx: &Sender<SparseMessage>) {
+        let hash = ready.vertex_hash.clone();
+
+        if let Some(vertex) = ready.vertex {
+            if !self.pending_rbc_vertices.contains_key(&hash) && vertex.hash == hash {
+                self.pending_rbc_vertices.insert(hash.clone(), vertex);
+            }
+        }
+
         let votes = self.ready_counts.entry(hash.clone()).or_default();
         votes.insert(sender);
 
         let ready_count = votes.len();
 
-        // 1. Amplification Step: If we see f+1 READYs, we must also send READY
-        // This ensures liveness if correct nodes are split.
         if ready_count >= self.f + 1 {
             self.try_send_ready(hash.clone(), dispatcher_tx).await;
         }
 
-        // 2. Delivery Step: If we see 2f+1 READYs, we deliver.
         let delivery_threshold = 2 * self.f + 1;
         if ready_count >= delivery_threshold && !self.delivered_vertices.contains(&hash) {
-            // Check if we have the body
             if let Some(vertex) = self.pending_rbc_vertices.remove(&hash) {
                 debug!("[Node {}] RBC DELIVERED vertex from Node {} in round {}", self.environment.my_node.id, vertex.source, vertex.round);
-                
-                // Mark as delivered so we don't process it again
+
                 self.echo_counts.remove(&hash);
-                self.ready_counts.remove(&hash);                
+                self.ready_counts.remove(&hash);
                 self.delivered_vertices.insert(hash);
 
-                // NOW we enter the DAG logic
                 self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }).await;
             } else {
-                // We have the votes but not the body (we missed the VAL).
-                // In a full implementation, we would fetch it here.
-                // For now, we wait (or log a warning).
                 warn!("[Node {}] RBC ready to deliver but missing vertex body for hash {:?}", self.environment.my_node.id, hash);
             }
         }
-
     }
-    // Helper to send READY ensuring we only send it once per hash
+
     async fn try_send_ready(&mut self, hash: VertexHash, dispatcher_tx: &Sender<SparseMessage>) {
-        // We use a special marker in ready_counts (e.g., our own ID) or a separate set to know if we sent it.
-        // For simplicity, let's assume we store our own vote in ready_counts when we send.
         let my_id = self.environment.my_node.id;
         let votes = self.ready_counts.entry(hash.clone()).or_default();
-        
+
         if !votes.contains(&my_id) {
             votes.insert(my_id);
+            let body = self.pending_rbc_vertices.get(&hash).cloned();
             let ready_msg = SparseMessage::RBCReady(crate::network::message::ReadyMessage {
                 vertex_hash: hash,
+                vertex: body,
             });
             self.broadcast(ready_msg, dispatcher_tx).await;
         }

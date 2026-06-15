@@ -18,11 +18,12 @@ pub struct CommitMessage {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EchoMessage {
-    pub vertex_hash : VertexHash,
+    pub vertex_hash: VertexHash,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReadyMessage {
-    pub vertex_hash : VertexHash,
+    pub vertex_hash: VertexHash,
+    pub vertex: Option<Vertex>,
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TimeoutMessage {

@@ -194,7 +194,7 @@ impl Bullshark {
                                 self.handle_rbc_echo(sender_id, echo.vertex_hash, &dispatcher_tx).await;
                             },
                             SparseMessage::RBCReady(ready) => {
-                                self.handle_rbc_ready(sender_id, ready.vertex_hash, &dispatcher_tx).await;
+                                self.handle_rbc_ready(sender_id, ready, &dispatcher_tx).await;
                             },
                             SparseMessage::Commit(_) => {
                                 // Handle commits if you use them
@@ -540,7 +540,11 @@ impl Bullshark {
 
         if !self.pending_rbc_vertices.contains_key(&hash) {
             self.pending_rbc_vertices.insert(hash.clone(), vertex.clone());
+        }
 
+        let my_id = self.environment.my_node.id;
+        if !self.echo_counts.entry(hash.clone()).or_default().contains(&my_id) {
+            self.echo_counts.get_mut(&hash).unwrap().insert(my_id);
             let echo_msg = SparseMessage::RBCEcho(crate::network::message::EchoMessage {
                 vertex_hash: hash.clone(),
             });
@@ -551,7 +555,7 @@ impl Bullshark {
 
             if ready_count >= delivery_threshold {
                 info!("[Node {}] RBC LATE DELIVERY: Body arrived after consensus for round {}", self.environment.my_node.id, vertex.round);
-                
+
                 self.delivered_vertices.insert(hash.clone());
                 self.echo_counts.remove(&hash);
                 self.ready_counts.remove(&hash);
@@ -571,13 +575,21 @@ impl Bullshark {
         votes.insert(sender);
 
         let threshold = 2 * self.f + 1;
-        
+
         if votes.len() >= threshold {
             self.try_send_ready(hash, dispatcher_tx).await;
         }
     }
 
-    async fn handle_rbc_ready(&mut self, sender: NodeId, hash: VertexHash, dispatcher_tx: &Sender<SparseMessage>) {
+    async fn handle_rbc_ready(&mut self, sender: NodeId, ready: crate::network::message::ReadyMessage, dispatcher_tx: &Sender<SparseMessage>) {
+        let hash = ready.vertex_hash.clone();
+
+        if let Some(vertex) = ready.vertex {
+            if !self.pending_rbc_vertices.contains_key(&hash) && vertex.hash == hash {
+                self.pending_rbc_vertices.insert(hash.clone(), vertex);
+            }
+        }
+
         let votes = self.ready_counts.entry(hash.clone()).or_default();
         votes.insert(sender);
 
@@ -591,9 +603,9 @@ impl Bullshark {
         if ready_count >= delivery_threshold && !self.delivered_vertices.contains(&hash) {
             if let Some(vertex) = self.pending_rbc_vertices.remove(&hash) {
                 debug!("[Node {}] RBC DELIVERED vertex from Node {} in round {}", self.environment.my_node.id, vertex.source, vertex.round);
-                
+
                 self.echo_counts.remove(&hash);
-                self.ready_counts.remove(&hash);                
+                self.ready_counts.remove(&hash);
                 self.delivered_vertices.insert(hash);
 
                 self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }).await;
@@ -606,11 +618,13 @@ impl Bullshark {
     async fn try_send_ready(&mut self, hash: VertexHash, dispatcher_tx: &Sender<SparseMessage>) {
         let my_id = self.environment.my_node.id;
         let votes = self.ready_counts.entry(hash.clone()).or_default();
-        
+
         if !votes.contains(&my_id) {
             votes.insert(my_id);
+            let body = self.pending_rbc_vertices.get(&hash).cloned();
             let ready_msg = SparseMessage::RBCReady(crate::network::message::ReadyMessage {
                 vertex_hash: hash,
+                vertex: body,
             });
             self.broadcast(ready_msg, dispatcher_tx).await;
         }

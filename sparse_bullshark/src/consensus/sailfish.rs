@@ -8,7 +8,7 @@ use tokio::{
     sync::mpsc::{self, Sender},
     time::{sleep, timeout, Duration, Instant}, // Added timeout
 };
-use shared::{domain::environment::Environment, transaction_generator::TransactionGenerator};
+use shared::{domain::{environment::Environment, node::NodeBehavior}, transaction_generator::TransactionGenerator};
 use crate::{
     consensus::dag::DAG,
     network::{broadcast::generate_nonce, message::{SparseMessage, VertexMessage, TimeoutMessage}},
@@ -23,7 +23,10 @@ const MESSAGE_BYTES_LENGTH: usize = 4;
 const EXECUTION_DURATION: u64 = 60;
 
 // SAILFISH CONSTANT: "Wait for leader until a timeout occurs"
-const ROUND_TIMEOUT_MS: u128 = 2000; 
+const ROUND_TIMEOUT_MS: u128 = 200;
+
+// Dispatcher channel: None = broadcast to all; Some(id) = unicast to that peer.
+type SailDispatch = (Option<NodeId>, SparseMessage);
 
 pub struct Sailfish {
     pub environment: Environment,
@@ -96,7 +99,7 @@ impl Sailfish {
     }
 
     // --- MAIN WORK LOOP ---
-    async fn process_work_loop(&mut self, dispatcher_tx: &Sender<SparseMessage>){
+    async fn process_work_loop(&mut self, dispatcher_tx: &Sender<SailDispatch>){
         let mut progress = true;
         while progress {
             progress = false;
@@ -105,32 +108,51 @@ impl Sailfish {
             // Sailfish Rule: Must check Leader OR TC for (round-1)
             if self.may_advance_round(dispatcher_tx).await {
                 progress = true;
-                debug!("[Node {}] Advancing to round {}", self.environment.my_node.id, self.round + 1);
-                
-                // Create vertex for CURRENT round (using info from round-1)
-                let new_vertex = self.create_new_vertex(self.round);
                 let my_id = self.environment.my_node.id;
-                
-                self.dag.insert(new_vertex.clone());
-                
-                // Update State
-                self.round += 1;
-                self.round_start_time = Instant::now();
-                self.timeout_sent = false;
-                self.current_round_tc = None; 
 
-                // Broadcast
-                let vertex_message = SparseMessage::Vertex(VertexMessage {
-                    sender: my_id,
-                    vertex: new_vertex.clone(),
-                });
-                
-                if dispatcher_tx.send(vertex_message).await.is_err() {
-                    error!("Channel closed");
+                if self.environment.my_node.behavior == NodeBehavior::Silent {
+                    // Silent: advance round state but never create or send a vertex.
+                    self.round += 1;
+                    self.round_start_time = Instant::now();
+                    self.timeout_sent = false;
+                    self.current_round_tc = None;
+                    warn!("[Node {}] SILENT: skipped vertex for round {}", my_id, self.round - 1);
+                } else {
+                    let new_vertex = self.create_new_vertex(self.round);
+                    self.dag.insert(new_vertex.clone());
+                    self.round += 1;
+                    self.round_start_time = Instant::now();
+                    self.timeout_sent = false;
+                    self.current_round_tc = None;
+
+                    if self.environment.my_node.behavior == NodeBehavior::Byz1 {
+                        // Byz1: unicast VAL to only 2f+1 peers instead of broadcasting.
+                        let quorum = 2 * self.f + 1;
+                        let peers: Vec<NodeId> = self.environment.nodes.iter()
+                            .map(|n| n.id)
+                            .filter(|&id| id != my_id)
+                            .take(quorum)
+                            .collect();
+                        warn!("[Node {}] BYZ1: sending VAL to only {}/{} peers",
+                            my_id, peers.len(), self.environment.nodes.len() - 1);
+                        for target in peers {
+                            self.unicast(target, SparseMessage::Vertex(VertexMessage {
+                                sender: my_id, vertex: new_vertex.clone(),
+                            }), dispatcher_tx).await;
+                        }
+                    } else {
+                        // Ok / Byz2: broadcast normally (byz2 attack fires later in try_send_ready).
+                        let vertex_message = SparseMessage::Vertex(VertexMessage {
+                            sender: my_id,
+                            vertex: new_vertex.clone(),
+                        });
+                        if dispatcher_tx.send((None, vertex_message)).await.is_err() {
+                            error!("Channel closed");
+                        }
+                    }
+
+                    self.handle_rbc_val(my_id, new_vertex.clone(), dispatcher_tx).await;
                 }
-                
-                // Treat our own vertex as received via RBC
-                self.handle_rbc_val(my_id, new_vertex.clone(), dispatcher_tx).await;
             }
 
             // 2. Process Pending Vertices (Standard)
@@ -160,7 +182,7 @@ impl Sailfish {
     // --- SAILFISH CORE LOGIC ---
 
     // The "Traffic Light" of the protocol
-    async fn may_advance_round(&mut self, dispatcher_tx: &Sender<SparseMessage>) -> bool {
+    async fn may_advance_round(&mut self, dispatcher_tx: &Sender<SailDispatch>) -> bool {
         if self.round == 1 { return true; } // Always advance from 0 to 1 (Genesis)
 
         let prev_round = self.round - 1;
@@ -209,7 +231,7 @@ impl Sailfish {
                 self.handle_timeout_vote(self.environment.my_node.id, prev_round, signature).await;
 
                 // Broadcast
-                let _ = dispatcher_tx.send(msg).await;
+                let _ = dispatcher_tx.send((None, msg)).await;
                 self.timeout_sent = true;
             }
         }
@@ -371,21 +393,34 @@ impl Sailfish {
                             // 3. COMMIT THE CAUSAL HISTORY
                             if !self.already_ordered.contains(&leader.hash) {
                                 // info!("[Node {}] ⚓ COMMIT Round {} Leader {}", self.environment.my_node.id, r, leader_id);
-                                
+
                                 // Perform BFS to count ALL blocks this leader pulls in
                                 let committed_count = self.commit_causal_history(leader.clone());
-                                
+
                                 self.finalized_block_count += committed_count;
-                                self.last_ordered_round = r; 
+                                self.last_ordered_round = r;
                             }
                         } else {
-                            break; // Cannot commit this round yet
+                            // Not enough votes yet. Check if more can still arrive.
+                            let r1_size = self.dag.get_round(r + 1).map_or(0, |v| v.len());
+                            let n = self.environment.nodes.len();
+                            let max_possible = votes + n.saturating_sub(r1_size);
+                            if max_possible < 2 * self.f + 1 {
+                                // Even if every missing node votes, threshold unreachable.
+                                // Byzantine timing attack — skip this leader.
+                                warn!("[Node {}] Skipping stuck leader at round {} (leader={}, votes={}/{}, r+1 DAG={}/{})",
+                                    self.environment.my_node.id, r, leader_id, votes, 2 * self.f + 1, r1_size, n);
+                                self.last_ordered_round = r;
+                                // continue to next round
+                            } else {
+                                break; // More votes may still arrive
+                            }
                         }
                     } else {
                         break; // Waiting for next round
                     }
                 } else {
-                    break; // Leader missing
+                    continue; // TC round — no leader vertex, skip this round's commit
                 }
             } else {
                 break;
@@ -457,7 +492,7 @@ impl Sailfish {
                     match msg {
                         SparseMessage::Vertex(v) => self.handle_rbc_val(sender, v.vertex, &dispatcher_tx).await,
                         SparseMessage::RBCEcho(e) => self.handle_rbc_echo(sender, e.vertex_hash, &dispatcher_tx).await,
-                        SparseMessage::RBCReady(r) => self.handle_rbc_ready(sender, r.vertex_hash, &dispatcher_tx).await,
+                        SparseMessage::RBCReady(r) => self.handle_rbc_ready(sender, r, &dispatcher_tx).await,
                         
                         // Handle Timeout Vote
                         SparseMessage::Timeout(t) => self.handle_timeout_vote(sender, t.round, t.signature).await,
@@ -490,16 +525,22 @@ impl Sailfish {
          }
     }
     
-    async fn handle_rbc_val(&mut self, _sender: NodeId, vertex: Vertex, dispatcher_tx: &Sender<SparseMessage>) {
+    async fn handle_rbc_val(&mut self, _sender: NodeId, vertex: Vertex, dispatcher_tx: &Sender<SailDispatch>) {
         let hash = vertex.hash.clone();
         
         if self.delivered_vertices.contains(&hash) {
             return; 
         }
 
+        // Store body if not already present (may have arrived via ECHO before VAL)
         if !self.pending_rbc_vertices.contains_key(&hash) {
             self.pending_rbc_vertices.insert(hash.clone(), vertex.clone());
+        }
 
+        // Send ECHO only once per hash; track by inserting own ID into echo_counts
+        let my_id = self.environment.my_node.id;
+        if !self.echo_counts.entry(hash.clone()).or_default().contains(&my_id) {
+            self.echo_counts.get_mut(&hash).unwrap().insert(my_id);
             let echo_msg = SparseMessage::RBCEcho(crate::network::message::EchoMessage {
                 vertex_hash: hash.clone(),
             });
@@ -510,7 +551,7 @@ impl Sailfish {
 
             if ready_count >= delivery_threshold {
                 debug!("[Node {}] RBC LATE DELIVERY: Body arrived after consensus for round {}", self.environment.my_node.id, vertex.round);
-                
+
                 self.delivered_vertices.insert(hash.clone());
                 self.echo_counts.remove(&hash);
                 self.ready_counts.remove(&hash);
@@ -521,7 +562,7 @@ impl Sailfish {
         }
     }
     
-    async fn handle_rbc_echo(&mut self, sender: NodeId, hash: VertexHash, dispatcher_tx: &Sender<SparseMessage>) {
+    async fn handle_rbc_echo(&mut self, sender: NodeId, hash: VertexHash, dispatcher_tx: &Sender<SailDispatch>) {
         if self.delivered_vertices.contains(&hash) {
             return;
         }
@@ -530,13 +571,29 @@ impl Sailfish {
         votes.insert(sender);
 
         let threshold = 2 * self.f + 1;
-        
+
         if votes.len() >= threshold {
             self.try_send_ready(hash, dispatcher_tx).await;
         }
     }
 
-    async fn handle_rbc_ready(&mut self, sender: NodeId, hash: VertexHash, dispatcher_tx: &Sender<SparseMessage>) {
+    async fn handle_rbc_ready(&mut self, sender: NodeId, ready: crate::network::message::ReadyMessage, dispatcher_tx: &Sender<SailDispatch>) {
+        let hash = ready.vertex_hash.clone();
+
+        // Store body from READY if we missed the VAL (fault tolerance)
+        if let Some(vertex) = ready.vertex {
+            if vertex.hash == hash {
+                if !self.pending_rbc_vertices.contains_key(&hash) {
+                    self.pending_rbc_vertices.insert(hash.clone(), vertex);
+                }
+            } else {
+                warn!("[Node {}] BYZ2 DETECTED: READY from Node {} has body hash {:?} but claimed {:?}",
+                    self.environment.my_node.id, sender,
+                    &vertex.hash[..4.min(vertex.hash.len())],
+                    &hash[..4.min(hash.len())]);
+            }
+        }
+
         let votes = self.ready_counts.entry(hash.clone()).or_default();
         votes.insert(sender);
 
@@ -550,9 +607,9 @@ impl Sailfish {
         if ready_count >= delivery_threshold && !self.delivered_vertices.contains(&hash) {
             if let Some(vertex) = self.pending_rbc_vertices.remove(&hash) {
                 debug!("[Node {}] RBC DELIVERED vertex from Node {} in round {}", self.environment.my_node.id, vertex.source, vertex.round);
-                
+
                 self.echo_counts.remove(&hash);
-                self.ready_counts.remove(&hash);                
+                self.ready_counts.remove(&hash);
                 self.delivered_vertices.insert(hash);
 
                 self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }).await;
@@ -562,22 +619,40 @@ impl Sailfish {
         }
     }
 
-    async fn try_send_ready(&mut self, hash: VertexHash, dispatcher_tx: &Sender<SparseMessage>) {
+    async fn try_send_ready(&mut self, hash: VertexHash, dispatcher_tx: &Sender<SailDispatch>) {
         let my_id = self.environment.my_node.id;
         let votes = self.ready_counts.entry(hash.clone()).or_default();
-        
+
         if !votes.contains(&my_id) {
             votes.insert(my_id);
+            let body = if self.environment.my_node.behavior == NodeBehavior::Byz2 {
+                // Byz2: include a fake body that won't match the hash — receivers detect this.
+                self.pending_rbc_vertices.get(&hash).map(|real| {
+                    let mut fake = real.clone();
+                    fake.block = b"byz2_fake_payload".to_vec();
+                    warn!("[Node {}] BYZ2: sending fake body in READY for hash {:?}", my_id, &hash[..4.min(hash.len())]);
+                    fake
+                })
+            } else {
+                self.pending_rbc_vertices.get(&hash).cloned()
+            };
             let ready_msg = SparseMessage::RBCReady(crate::network::message::ReadyMessage {
                 vertex_hash: hash,
+                vertex: body,
             });
             self.broadcast(ready_msg, dispatcher_tx).await;
         }
     }
 
-    async fn broadcast(&self, msg: SparseMessage, dispatcher_tx: &Sender<SparseMessage>){
-        if let Err(_) = dispatcher_tx.send(msg).await{
+    async fn broadcast(&self, msg: SparseMessage, dispatcher_tx: &Sender<SailDispatch>){
+        if let Err(_) = dispatcher_tx.send((None, msg)).await{
            error!("[Node {}] Failed to broadcast message: channel closed", self.environment.my_node.id);
+        }
+    }
+
+    async fn unicast(&self, target: NodeId, msg: SparseMessage, dispatcher_tx: &Sender<SailDispatch>){
+        if let Err(_) = dispatcher_tx.send((Some(target), msg)).await{
+           error!("[Node {}] Failed to unicast to {}: channel closed", self.environment.my_node.id, target);
         }
     }
 
@@ -733,7 +808,7 @@ impl Sailfish {
 
 
      // ✅ UPDATED: Parallel Sender
-    fn start_message_dispatcher(&self, mut dispatcher_receiver: mpsc::Receiver<SparseMessage>, connections: Vec<Option<TcpStream>>) {
+    fn start_message_dispatcher(&self, mut dispatcher_receiver: mpsc::Receiver<SailDispatch>, connections: Vec<Option<TcpStream>>) {
         let private_key = self.private_key.clone();
         let test_flag = self.environment.test_flag;
 
@@ -759,9 +834,9 @@ impl Sailfish {
 
         // 2. Main Dispatcher Loop
         tokio::spawn(async move {
-            while let Some(message) = dispatcher_receiver.recv().await {
+            while let Some((target, message)) = dispatcher_receiver.recv().await {
                 if let Ok(payload) = bincode::serialize(&message) {
-                    
+
                     let signature = if !test_flag {
                         private_key.sign(&payload)
                     } else {
@@ -769,16 +844,26 @@ impl Sailfish {
                     };
 
                     let length_bytes = (payload.len() as u32).to_be_bytes();
-                    
+
                     let mut frame = Vec::with_capacity(4 + payload.len() + 64);
                     frame.extend_from_slice(&length_bytes);
                     frame.extend_from_slice(&payload);
                     frame.extend_from_slice(signature.as_ref());
 
-                    // Send to all writer tasks instantly
-                    for tx in peer_senders.iter() {
-                        if let Some(sender) = tx {
-                            let _ = sender.send(frame.clone()).await;
+                    match target {
+                        None => {
+                            // Broadcast to all peers
+                            for tx in peer_senders.iter() {
+                                if let Some(sender) = tx {
+                                    let _ = sender.send(frame.clone()).await;
+                                }
+                            }
+                        }
+                        Some(peer_id) => {
+                            // Unicast to specific peer
+                            if let Some(Some(tx)) = peer_senders.get(peer_id as usize) {
+                                let _ = tx.send(frame.clone()).await;
+                            }
                         }
                     }
                 }
