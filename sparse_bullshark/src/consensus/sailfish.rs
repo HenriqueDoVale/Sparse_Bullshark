@@ -23,7 +23,7 @@ const MESSAGE_BYTES_LENGTH: usize = 4;
 const EXECUTION_DURATION: u64 = 60;
 
 // SAILFISH CONSTANT: "Wait for leader until a timeout occurs"
-const ROUND_TIMEOUT_MS: u128 = 200;
+const ROUND_TIMEOUT_MS: u128 = 500;
 
 // Dispatcher channel: None = broadcast to all; Some(id) = unicast to that peer.
 type SailDispatch = (Option<NodeId>, SparseMessage);
@@ -58,6 +58,11 @@ pub struct Sailfish {
     pub ready_counts : HashMap<VertexHash, HashSet<NodeId>>,
     pub delivered_vertices: HashSet<VertexHash>,
     pub pending_rbc_vertices: HashMap<VertexHash, Vertex>,
+
+    // Latency tracking: delivery time per vertex → used in BFS commit
+    vertex_timestamps: HashMap<VertexHash, Instant>,
+    total_commit_latency_us: u128,
+    committed_vertex_count: u64,
 }
 
 impl Sailfish {
@@ -93,6 +98,9 @@ impl Sailfish {
             ready_counts : HashMap::new(),
             delivered_vertices : HashSet::new(),
             pending_rbc_vertices : HashMap::new(),
+            vertex_timestamps: HashMap::new(),
+            total_commit_latency_us: 0,
+            committed_vertex_count: 0,
         };
         node.add_genesis_block();
         node
@@ -119,6 +127,7 @@ impl Sailfish {
                     warn!("[Node {}] SILENT: skipped vertex for round {}", my_id, self.round - 1);
                 } else {
                     let new_vertex = self.create_new_vertex(self.round);
+                    self.vertex_timestamps.entry(new_vertex.hash.clone()).or_insert_with(Instant::now);
                     self.dag.insert(new_vertex.clone());
                     self.round += 1;
                     self.round_start_time = Instant::now();
@@ -165,6 +174,7 @@ impl Sailfish {
                         if self.validate_vertex(&vm.vertex, vm.vertex.round, sender_id) {
                             progress = true;
                             debug!("[Node {}] Un-buffered vertex from Node {} in round {}", self.environment.my_node.id, sender_id, vm.vertex.round);
+                            self.vertex_timestamps.entry(vm.vertex.hash.clone()).or_insert_with(Instant::now);
                             self.dag.insert(vm.vertex.clone());
                             self.try_committing_sailfish(); // Check commit rule
                         } else {
@@ -441,6 +451,10 @@ impl Sailfish {
             // Mark as ordered
             self.already_ordered.insert(v.hash.clone());
             count += 1;
+            if let Some(ts) = self.vertex_timestamps.remove(&v.hash) {
+                self.total_commit_latency_us += ts.elapsed().as_micros();
+                self.committed_vertex_count += 1;
+            }
 
             // Add parents to stack (Traverse backwards)
             if v.round > 0 { // Don't go below genesis
@@ -515,6 +529,7 @@ impl Sailfish {
     
     async fn handle_new_vertex_message(&mut self, sender: NodeId, vm: VertexMessage) {
          if self.validate_vertex(&vm.vertex, vm.vertex.round, sender) {
+            self.vertex_timestamps.entry(vm.vertex.hash.clone()).or_insert_with(Instant::now);
             self.dag.insert(vm.vertex.clone());
             self.try_committing_sailfish();
          } else {
@@ -872,7 +887,40 @@ impl Sailfish {
     }
 
     fn print_dag_stats(&self) {
-        println!("[Node {}] Final ordered round: {}", self.environment.my_node.id, self.last_ordered_round);
-        println!("Blocks finalized: {}", self.finalized_block_count);
+        let n             = self.environment.nodes.len();
+        let f_tolerance   = self.f;
+        let f_actual      = self.environment.nodes.iter()
+                                .filter(|node| node.behavior != NodeBehavior::Ok)
+                                .count();
+        let tx_size    = self.environment.transaction_size;
+        let n_tx       = self.environment.n_transactions;
+        let exec_secs  = EXECUTION_DURATION as f64;
+
+        let total_tx    = self.finalized_block_count * n_tx;
+        let total_bytes = total_tx * tx_size;
+        let tps         = total_tx as f64 / exec_secs;
+        let bps         = total_bytes as f64 / exec_secs;
+        let rps         = self.last_ordered_round as f64 / exec_secs;
+
+        println!("\n+ CONFIG:");
+        println!("  Protocol:             Sailfish (Standard RBC)");
+        println!("  Faults:               {} node(s)", f_actual);
+        println!("  Fault tolerance:      {} node(s)", f_tolerance);
+        println!("  Committee size:       {} node(s)", n);
+        println!("  Transaction size:     {} B", tx_size);
+        println!("  Transactions/block:   {}", n_tx);
+        println!("  Block size:           {} B", n_tx * tx_size);
+        println!("  Execution time:       {} s", EXECUTION_DURATION);
+        println!("\n+ RESULTS:");
+        println!("  Ordered rounds:       {}", self.last_ordered_round);
+        println!("  Blocks finalized:     {}", self.finalized_block_count);
+        println!("  Rounds/s:             {:.1}", rps);
+        let avg_latency_ms = if self.committed_vertex_count > 0 {
+            (self.total_commit_latency_us as f64 / self.committed_vertex_count as f64) / 1000.0
+        } else { 0.0 };
+
+        println!("  Consensus TPS:        {:.0} tx/s", tps);
+        println!("  Consensus BPS:        {:.0} B/s", bps);
+        println!("  Consensus latency:    {:.1} ms", avg_latency_ms);
     }
 }

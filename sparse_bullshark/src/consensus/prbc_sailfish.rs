@@ -92,6 +92,11 @@ pub struct PRBCSailfish {
     pub finalized_block_count: usize, // executed (payload verified, data plane)
     already_ordered: HashSet<VertexHash>,
     total_bytes_created: u64,
+
+    // Latency tracking
+    vertex_timestamps: HashMap<VertexHash, Instant>,
+    total_commit_latency_us: u128,
+    committed_vertex_count: u64,
 }
 
 impl PRBCSailfish {
@@ -135,6 +140,9 @@ impl PRBCSailfish {
             finalized_block_count: 0,
             already_ordered: HashSet::new(),
             total_bytes_created: 0,
+            vertex_timestamps: HashMap::new(),
+            total_commit_latency_us: 0,
+            committed_vertex_count: 0,
         };
         node.add_genesis_block();
         node
@@ -160,6 +168,7 @@ impl PRBCSailfish {
                     warn!("[Node {}] SILENT: skipped PRBC propose for round {}", my_id, self.round - 1);
                 } else {
                     let new_vertex = self.create_new_vertex(self.round);
+                    self.vertex_timestamps.entry(new_vertex.hash.clone()).or_insert_with(Instant::now);
                     self.dag.insert(new_vertex.clone());
                     self.round += 1;
                     self.round_start_time = Instant::now();
@@ -384,6 +393,7 @@ impl PRBCSailfish {
                 tc: None,
                 nvc: None,
             };
+            self.vertex_timestamps.entry(hash.clone()).or_insert_with(Instant::now);
             self.dag.insert(skeleton);
         }
 
@@ -496,6 +506,10 @@ impl PRBCSailfish {
             }
             self.already_ordered.insert(v.hash.clone());
             self.consensus_committed_count += 1;
+            if let Some(ts) = self.vertex_timestamps.remove(&v.hash) {
+                self.total_commit_latency_us += ts.elapsed().as_micros();
+                self.committed_vertex_count += 1;
+            }
 
             // Two-tiered state:
             if self.execution_ready.contains(&v.hash) {
@@ -1230,13 +1244,47 @@ impl PRBCSailfish {
     }
 
     fn print_dag_stats(&self) {
-        println!(
-            "[Node {}] PRBC Final ordered round: {}",
-            self.environment.my_node.id, self.last_ordered_round
-        );
-        println!(
-            "Consensus committed: {}  |  Execution ready (finalized): {}",
-            self.consensus_committed_count, self.finalized_block_count
-        );
+        let n           = self.environment.nodes.len();
+        let f_tolerance = self.f;
+        let f_actual    = self.environment.nodes.iter()
+                              .filter(|node| node.behavior != NodeBehavior::Ok)
+                              .count();
+        let tx_size    = self.environment.transaction_size;
+        let n_tx       = self.environment.n_transactions;
+        let exec_secs  = EXECUTION_DURATION as f64;
+
+        let con_tx    = self.consensus_committed_count * n_tx;
+        let exe_tx    = self.finalized_block_count * n_tx;
+        let con_bytes = con_tx * tx_size;
+        let exe_bytes = exe_tx * tx_size;
+        let con_tps   = con_tx as f64 / exec_secs;
+        let con_bps   = con_bytes as f64 / exec_secs;
+        let exe_tps   = exe_tx as f64 / exec_secs;
+        let exe_bps   = exe_bytes as f64 / exec_secs;
+        let rps       = self.last_ordered_round as f64 / exec_secs;
+
+        println!("\n+ CONFIG:");
+        println!("  Protocol:             PRBC-Sailfish");
+        println!("  Faults:               {} node(s)", f_actual);
+        println!("  Fault tolerance:      {} node(s)", f_tolerance);
+        println!("  Committee size:       {} node(s)", n);
+        println!("  Transaction size:     {} B", tx_size);
+        println!("  Transactions/block:   {}", n_tx);
+        println!("  Block size:           {} B", n_tx * tx_size);
+        println!("  Execution time:       {} s", EXECUTION_DURATION);
+        println!("\n+ RESULTS:");
+        println!("  Ordered rounds:       {}", self.last_ordered_round);
+        println!("  Consensus committed:  {}", self.consensus_committed_count);
+        println!("  Execution finalized:  {}", self.finalized_block_count);
+        println!("  Rounds/s:             {:.1}", rps);
+        let avg_latency_ms = if self.committed_vertex_count > 0 {
+            (self.total_commit_latency_us as f64 / self.committed_vertex_count as f64) / 1000.0
+        } else { 0.0 };
+
+        println!("  Consensus TPS:        {:.0} tx/s", con_tps);
+        println!("  Consensus BPS:        {:.0} B/s", con_bps);
+        println!("  Consensus latency:    {:.1} ms", avg_latency_ms);
+        println!("  Execution TPS:        {:.0} tx/s", exe_tps);
+        println!("  Execution BPS:        {:.0} B/s", exe_bps);
     }
 }
