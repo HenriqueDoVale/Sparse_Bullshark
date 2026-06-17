@@ -37,12 +37,18 @@ pub fn get_environment(args: Vec<String>) -> Result<Environment, Box<dyn Error>>
     let nodes = read_nodes_from_csv(NODES_FILENAME)?;
     let my_node = nodes.iter().find(|node| node.id == my_id).ok_or("This process' node was not found")?.clone();
 
+    let input_rate: u64 = env::var("INPUT_RATE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
     Ok(Environment {
         my_node,
         nodes,
         test_flag,
         transaction_size,
         n_transactions,
+        input_rate,
     })
 }
 

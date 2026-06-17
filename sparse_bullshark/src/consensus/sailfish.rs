@@ -33,7 +33,7 @@ pub struct Sailfish {
     pub dag: DAG,
     pub f: usize,
     pub public_keys: HashMap<NodeId, PublicKey>,
-    transaction_generator: TransactionGenerator,
+    batch_receiver: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
     private_key: Arc<Keypair>,
     
     // --- Sailfish Specific State ---
@@ -70,15 +70,13 @@ impl Sailfish {
         println!("Sailfish");
         let n = environment.nodes.len();
         let f = (n.saturating_sub(1)) / 3;
-        let transaction_size = environment.transaction_size;
-        let n_transactions = environment.n_transactions;
-        
+
         let mut node = Sailfish {
             environment,
             dag: DAG::new(),
             f,
             public_keys,
-            transaction_generator: TransactionGenerator::new(transaction_size, n_transactions),
+            batch_receiver: None,
             private_key: Arc::new(private_key),
             
             // Sailfish Init
@@ -126,7 +124,8 @@ impl Sailfish {
                     self.current_round_tc = None;
                     warn!("[Node {}] SILENT: skipped vertex for round {}", my_id, self.round - 1);
                 } else {
-                    let new_vertex = self.create_new_vertex(self.round);
+                    let block = self.next_batch().await;
+                    let new_vertex = self.create_new_vertex(self.round, block);
                     self.vertex_timestamps.entry(new_vertex.hash.clone()).or_insert_with(Instant::now);
                     self.dag.insert(new_vertex.clone());
                     self.round += 1;
@@ -289,7 +288,7 @@ impl Sailfish {
         }
     }
 
-    fn create_new_vertex(&mut self, round: u64) -> Vertex {
+    fn create_new_vertex(&mut self, round: u64, block: Vec<u8>) -> Vertex {
         let prev_round = round - 1;
         let candidates = self.dag.get_round(prev_round).cloned().unwrap_or_default();
         
@@ -310,7 +309,7 @@ impl Sailfish {
             hash: vec![],
             round,
             source: self.environment.my_node.id,
-            block: bincode::serialize(&self.transaction_generator.generate()).expect("Block gen failed"),
+            block,
             edges,
             signed_round: vec![],
             sample_proof: vec![],
@@ -475,7 +474,43 @@ impl Sailfish {
 
     // --- STANDARD BOILERPLATE (Network & RBC) ---
     
+    async fn next_batch(&mut self) -> Vec<u8> {
+        if let Some(rx) = &mut self.batch_receiver {
+            match rx.try_recv() {
+                Ok(b) => return b,
+                Err(_) => if let Some(b) = rx.recv().await { return b; },
+            }
+        }
+        vec![]
+    }
+
     pub async fn start(mut self) {
+        // Spawn parallel transaction generator
+        let tx_size    = self.environment.transaction_size;
+        let n_tx       = self.environment.n_transactions;
+        let input_rate = self.environment.input_rate;
+        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        self.batch_receiver = Some(batch_rx);
+
+        tokio::spawn(async move {
+            let mut gen = TransactionGenerator::new(tx_size, n_tx);
+            if input_rate > 0 {
+                let interval_us = (n_tx as u64 * 1_000_000) / input_rate;
+                let mut ticker = tokio::time::interval(Duration::from_micros(interval_us));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    let batch = bincode::serialize(&gen.generate()).expect("batch serialize failed");
+                    if batch_tx.send(batch).await.is_err() { break; }
+                }
+            } else {
+                loop {
+                    let batch = bincode::serialize(&gen.generate()).expect("batch serialize failed");
+                    if batch_tx.send(batch).await.is_err() { break; }
+                }
+            }
+        });
+
         let address = format!("{}:{}", self.environment.my_node.host, self.environment.my_node.port);
         let listener = TcpListener::bind(&address).await.expect("Failed to bind");
         let (message_tx, mut message_rx) = mpsc::channel(MESSAGE_CHANNEL_SIZE);
@@ -902,11 +937,19 @@ impl Sailfish {
         let bps         = total_bytes as f64 / exec_secs;
         let rps         = self.last_ordered_round as f64 / exec_secs;
 
+        let input_rate = self.environment.input_rate;
+        let rate_label = if input_rate == 0 {
+            "unlimited".to_string()
+        } else {
+            format!("{} tx/s", input_rate)
+        };
+
         println!("\n+ CONFIG:");
         println!("  Protocol:             Sailfish (Standard RBC)");
         println!("  Faults:               {} node(s)", f_actual);
         println!("  Fault tolerance:      {} node(s)", f_tolerance);
         println!("  Committee size:       {} node(s)", n);
+        println!("  Input rate:           {}", rate_label);
         println!("  Transaction size:     {} B", tx_size);
         println!("  Transactions/block:   {}", n_tx);
         println!("  Block size:           {} B", n_tx * tx_size);

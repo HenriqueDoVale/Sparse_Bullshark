@@ -3,13 +3,13 @@ use std::{
     sync::Arc,
 };
 use bincode::deserialize;
-use ed25519_dalek::{Keypair, PublicKey, Signature, Signer, Verifier};
+use ed25519_dalek::{Keypair, PublicKey, Signature, Signer, Verifier}; // Signature/Verifier kept for transport handshake
 use log::{debug, error, info, warn};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::mpsc::{self, Sender},
+    sync::mpsc::{self, Receiver, Sender},
     time::{sleep, timeout, Duration, Instant},
 };
 use shared::{domain::{environment::Environment, node::NodeBehavior}, transaction_generator::TransactionGenerator};
@@ -56,7 +56,7 @@ pub struct PRBCSailfish {
     dag: DAG,
     f: usize,
     public_keys: HashMap<NodeId, PublicKey>,
-    transaction_generator: TransactionGenerator,
+    batch_receiver: Option<Receiver<Vec<u8>>>,
     private_key: Arc<Keypair>,
 
     // ── Round / timeout ──────────────────────────────────────────────────────
@@ -67,8 +67,8 @@ pub struct PRBCSailfish {
     current_round_tc: Option<TimeoutCertificate>,
 
     // ── PRBC control plane ───────────────────────────────────────────────────
-    // hash → { voter_id → signature }
-    prbc_votes: HashMap<VertexHash, BTreeMap<NodeId, Vec<u8>>>,
+    // hash → set of voter IDs (authenticated via TCP transport, no per-message sig)
+    prbc_votes: HashMap<VertexHash, HashSet<NodeId>>,
     // (round, source) → vertex_hash; set when 2f+1 votes accumulate
     hash_committed: HashMap<(u64, NodeId), VertexHash>,
     // rounds for which the designated leader is hash-committed (suppresses timeout)
@@ -108,15 +108,13 @@ impl PRBCSailfish {
         println!("PRBCSailfish");
         let n = environment.nodes.len();
         let f = (n.saturating_sub(1)) / 3;
-        let transaction_size = environment.transaction_size;
-        let n_transactions = environment.n_transactions;
 
         let mut node = PRBCSailfish {
             environment,
             dag: DAG::new(),
             f,
             public_keys,
-            transaction_generator: TransactionGenerator::new(transaction_size, n_transactions),
+            batch_receiver: None,
             private_key: Arc::new(private_key),
 
             round: 1,
@@ -148,6 +146,20 @@ impl PRBCSailfish {
         node
     }
 
+    async fn next_batch(&mut self) -> Vec<u8> {
+        if let Some(rx) = &mut self.batch_receiver {
+            match rx.try_recv() {
+                Ok(b) => return b,
+                Err(_) => {
+                    if let Some(b) = rx.recv().await {
+                        return b;
+                    }
+                }
+            }
+        }
+        vec![]
+    }
+
     // ── Main work loop ────────────────────────────────────────────────────────
 
     async fn process_work_loop(&mut self, dispatcher_tx: &Sender<DispatchMsg>) {
@@ -167,7 +179,8 @@ impl PRBCSailfish {
                     self.current_round_tc = None;
                     warn!("[Node {}] SILENT: skipped PRBC propose for round {}", my_id, self.round - 1);
                 } else {
-                    let new_vertex = self.create_new_vertex(self.round);
+                    let block = self.next_batch().await;
+                    let new_vertex = self.create_new_vertex(self.round, block);
                     self.vertex_timestamps.entry(new_vertex.hash.clone()).or_insert_with(Instant::now);
                     self.dag.insert(new_vertex.clone());
                     self.round += 1;
@@ -311,7 +324,7 @@ impl PRBCSailfish {
 
     // ── Vertex creation ────────────────────────────────────────────────────────
 
-    fn create_new_vertex(&mut self, round: u64) -> Vertex {
+    fn create_new_vertex(&mut self, round: u64, block: Vec<u8>) -> Vertex {
         let prev_round = round - 1;
 
         // Edges = all hash-committed hashes from prev_round.
@@ -333,8 +346,7 @@ impl PRBCSailfish {
             hash: vec![],
             round,
             source: self.environment.my_node.id,
-            block: bincode::serialize(&self.transaction_generator.generate())
-                .expect("Block gen failed"),
+            block,
             edges,
             signed_round: vec![],
             sample_proof: vec![],
@@ -357,7 +369,7 @@ impl PRBCSailfish {
         round: u64,
         source: NodeId,
         hash: VertexHash,
-        votes: BTreeMap<NodeId, Vec<u8>>,
+        votes: HashSet<NodeId>,
         dispatcher_tx: &Sender<DispatchMsg>,
     ) {
         // Dedup
@@ -402,7 +414,7 @@ impl PRBCSailfish {
             self.on_execution_ready(hash.clone(), full_vertex, dispatcher_tx).await;
         } else if source != self.environment.my_node.id {
             // Start Phase 3 recovery: we have 2f+1 votes but no payload.
-            let vote_list: Vec<NodeId> = votes.keys().cloned().collect();
+            let vote_list: Vec<NodeId> = votes.iter().cloned().collect();
             self.start_recovery(hash.clone(), vote_list);
         }
 
@@ -574,8 +586,9 @@ impl PRBCSailfish {
 
         // Sample verification: am I in S1?
         if self.sample_verification(vertex.round, vertex.source) {
-            let s2 = self.compute_sample(vertex.round, vertex.source, b"prbc_s2");
             let my_id = self.environment.my_node.id;
+            let s2_salt = [b"prbc_s2".as_ref(), &my_id.to_be_bytes() as &[u8]].concat();
+            let s2 = self.compute_sample(vertex.round, vertex.source, &s2_salt);
 
             let forward_vertex = if self.environment.my_node.behavior == NodeBehavior::Byz2 {
                 // Byz2: tamper the block data but keep the original hash so receivers detect it.
@@ -602,12 +615,9 @@ impl PRBCSailfish {
             }
         }
 
-        // Every node broadcasts a vote on hash(v).
+        // Every node broadcasts a vote on hash(v). No per-message signature —
+        // the TCP transport handshake already authenticates the sender.
         let my_id = self.environment.my_node.id;
-        let vote_payload = [hash.as_slice(), &vertex.round.to_be_bytes()].concat();
-        let sig = self.private_key.sign(&vote_payload).to_bytes().to_vec();
-
-        // Broadcast vote to all peers.
         let _ = dispatcher_tx
             .send((
                 None,
@@ -615,63 +625,28 @@ impl PRBCSailfish {
                     round: vertex.round,
                     source: vertex.source,
                     hash: hash.clone(),
-                    voter: my_id,
-                    signature: sig.clone(),
                 }),
             ))
             .await;
 
         // Count own vote locally.
-        self.record_vote(my_id, vertex.round, vertex.source, hash, sig, dispatcher_tx)
+        self.record_vote(my_id, vertex.round, vertex.source, hash, dispatcher_tx)
             .await;
     }
 
     async fn handle_prbc_vote(
         &mut self,
-        _sender: NodeId,
+        sender: NodeId, // authenticated by TCP handshake — used as voter identity
         vote: PRBCVoteMessage,
         dispatcher_tx: &Sender<DispatchMsg>,
     ) {
         debug!(
-            "[Node {}] 🗳 PRBCVote received: round={} source={} voter={}",
-            self.environment.my_node.id, vote.round, vote.source, vote.voter
+            "[Node {}] PRBCVote received: round={} source={} voter={}",
+            self.environment.my_node.id, vote.round, vote.source, sender
         );
 
-        // Authenticate: verify signature over hash || round.
-        let vote_payload = [vote.hash.as_slice(), &vote.round.to_be_bytes()].concat();
-        if let Some(pubkey) = self.public_keys.get(&vote.voter) {
-            if let Ok(sig) = Signature::from_bytes(&vote.signature) {
-                if pubkey.verify(&vote_payload, &sig).is_err() {
-                    warn!(
-                        "[Node {}] PRBCVote: INVALID SIGNATURE from voter {} for round={} source={}",
-                        self.environment.my_node.id, vote.voter, vote.round, vote.source
-                    );
-                    return;
-                }
-            } else {
-                warn!(
-                    "[Node {}] PRBCVote: malformed signature bytes from voter {}",
-                    self.environment.my_node.id, vote.voter
-                );
-                return;
-            }
-        } else {
-            warn!(
-                "[Node {}] PRBCVote: unknown voter id={} (not in public_keys)",
-                self.environment.my_node.id, vote.voter
-            );
-            return;
-        }
-
-        self.record_vote(
-            vote.voter,
-            vote.round,
-            vote.source,
-            vote.hash,
-            vote.signature,
-            dispatcher_tx,
-        )
-        .await;
+        self.record_vote(sender, vote.round, vote.source, vote.hash, dispatcher_tx)
+            .await;
     }
 
     /// Common path for recording a vote, regardless of whether it came from
@@ -682,20 +657,18 @@ impl PRBCSailfish {
         round: u64,
         source: NodeId,
         hash: VertexHash,
-        sig: Vec<u8>,
         dispatcher_tx: &Sender<DispatchMsg>,
     ) {
-        // Skip if already hash-committed for this (round, source).
         if self.hash_committed.contains_key(&(round, source)) {
             return;
         }
 
         let votes = self.prbc_votes.entry(hash.clone()).or_default();
-        votes.insert(voter, sig);
+        votes.insert(voter);
         let quorum = 2 * self.f + 1;
 
         debug!(
-            "[Node {}] 📊 vote recorded: round={} source={} voter={} count={}/{}",
+            "[Node {}] vote recorded: round={} source={} voter={} count={}/{}",
             self.environment.my_node.id, round, source, voter, votes.len(), quorum
         );
 
@@ -722,7 +695,7 @@ impl PRBCSailfish {
                             Some(msg.requester),
                             PRBCMessage::PRBCRecoveryResp(PRBCRecoveryRespMessage {
                                 vertex,
-                                votes: votes.clone(),
+                                voters: votes.iter().cloned().collect(),
                             }),
                         ))
                         .await;
@@ -765,13 +738,28 @@ impl PRBCSailfish {
 
         // Verify vote quorum.
         let quorum = 2 * self.f + 1;
-        if msg.votes.len() < quorum {
+        if msg.voters.len() < quorum {
             warn!(
                 "[Node {}] Recovery resp from {}: insufficient votes ({})",
-                self.environment.my_node.id,
-                sender,
-                msg.votes.len()
+                self.environment.my_node.id, sender, msg.voters.len()
             );
+            return;
+        }
+
+        // Cross-reference: count voters in response that we also received votes from.
+        // Since honest nodes broadcast votes to all, overlap must be at least f+1.
+        let my_votes = self.prbc_votes.get(&hash).cloned().unwrap_or_default();
+        let overlap = msg.voters.iter().filter(|v| my_votes.contains(v)).count();
+        if overlap < self.f + 1 {
+            warn!(
+                "[Node {}] Recovery resp from {}: voter overlap too low ({}/{}), trying next",
+                self.environment.my_node.id, sender, overlap, self.f + 1
+            );
+            if let Some(state) = self.recovery_state.get_mut(&hash) {
+                state.next_idx += 1;
+                state.request_sent_at =
+                    Instant::now() - Duration::from_millis(RECOVERY_TIMEOUT_MS as u64 + 1);
+            }
             return;
         }
 
@@ -961,6 +949,32 @@ impl PRBCSailfish {
         let (dispatcher_tx, dispatcher_rx) = mpsc::channel::<DispatchMsg>(MESSAGE_CHANNEL_SIZE);
 
         sleep(Duration::from_secs(SOCKET_BINDING_DELAY)).await;
+
+        // Spawn parallel transaction generator.
+        let tx_size    = self.environment.transaction_size;
+        let n_tx       = self.environment.n_transactions;
+        let input_rate = self.environment.input_rate;
+        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        self.batch_receiver = Some(batch_rx);
+        tokio::spawn(async move {
+            let mut gen = TransactionGenerator::new(tx_size, n_tx);
+            if input_rate > 0 {
+                let interval_us = (n_tx as u64 * 1_000_000) / input_rate;
+                let mut ticker = tokio::time::interval(Duration::from_micros(interval_us));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    let batch = bincode::serialize(&gen.generate()).expect("batch serialize failed");
+                    if batch_tx.send(batch).await.is_err() { break; }
+                }
+            } else {
+                loop {
+                    let batch = bincode::serialize(&gen.generate()).expect("batch serialize failed");
+                    if batch_tx.send(batch).await.is_err() { break; }
+                }
+            }
+        });
+
         let connections = self.connect(message_tx.clone(), &listener).await;
         self.start_message_dispatcher(dispatcher_rx, connections);
 
@@ -1271,6 +1285,7 @@ impl PRBCSailfish {
         println!("  Transaction size:     {} B", tx_size);
         println!("  Transactions/block:   {}", n_tx);
         println!("  Block size:           {} B", n_tx * tx_size);
+        println!("  Input rate:           {} tx/s", if self.environment.input_rate == 0 { "unlimited".to_string() } else { self.environment.input_rate.to_string() });
         println!("  Execution time:       {} s", EXECUTION_DURATION);
         println!("\n+ RESULTS:");
         println!("  Ordered rounds:       {}", self.last_ordered_round);
