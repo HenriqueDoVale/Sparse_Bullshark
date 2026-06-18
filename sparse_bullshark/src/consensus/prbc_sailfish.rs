@@ -35,7 +35,7 @@ const MESSAGE_BYTES_LENGTH: usize = 4;
 const EXECUTION_DURATION: u64 = 60;
 
 // ── Protocol constants ────────────────────────────────────────────────────────
-const ROUND_TIMEOUT_MS: u128 = 200;
+const ROUND_TIMEOUT_MS: u128 = 500;
 const RECOVERY_TIMEOUT_MS: u128 = 500;
 // Sample size = PRBC_C * sqrt(n), rounded up
 const PRBC_C: f64 = 1.4; // ceil(PRBC_C * sqrt(n)) ≈ 4 for n=8
