@@ -71,6 +71,9 @@ pub struct PRBCSailfish {
     prbc_votes: HashMap<VertexHash, HashSet<NodeId>>,
     // (round, source) → vertex_hash; set when 2f+1 votes accumulate
     hash_committed: HashMap<(u64, NodeId), VertexHash>,
+    // O(1) index: round → set of sources that are hash-committed in that round.
+    // Avoids the O(total_entries) linear scan in may_advance_round and try_committing_prbc.
+    hash_committed_by_round: HashMap<u64, HashSet<NodeId>>,
     // rounds for which the designated leader is hash-committed (suppresses timeout)
     timeout_suspended: HashSet<u64>,
 
@@ -125,6 +128,7 @@ impl PRBCSailfish {
 
             prbc_votes: HashMap::new(),
             hash_committed: HashMap::new(),
+            hash_committed_by_round: HashMap::new(),
             timeout_suspended: HashSet::new(),
 
             prbc_payloads: HashMap::new(),
@@ -228,12 +232,11 @@ impl PRBCSailfish {
         let prev_round = self.round - 1;
         let quorum = 2 * self.f + 1;
 
-        // 1. Do we have 2f+1 hash-committed vertices from prev_round?
+        // 1. Do we have 2f+1 hash-committed vertices from prev_round? O(1) via index.
         let hc_count = self
-            .hash_committed
-            .keys()
-            .filter(|(r, _)| *r == prev_round)
-            .count();
+            .hash_committed_by_round
+            .get(&prev_round)
+            .map_or(0, |s| s.len());
 
         if hc_count < quorum {
             debug!(
@@ -296,7 +299,9 @@ impl PRBCSailfish {
 
     fn has_leader_hash_committed(&self, round: u64) -> bool {
         let leader_id = (round % self.environment.nodes.len() as u64) as NodeId;
-        self.hash_committed.contains_key(&(round, leader_id))
+        self.hash_committed_by_round
+            .get(&round)
+            .map_or(false, |s| s.contains(&leader_id))
     }
 
     async fn handle_timeout_vote(&mut self, sender: NodeId, round: u64, signature: Vec<u8>) {
@@ -327,13 +332,15 @@ impl PRBCSailfish {
     fn create_new_vertex(&mut self, round: u64, block: Vec<u8>) -> Vertex {
         let prev_round = round - 1;
 
-        // Edges = all hash-committed hashes from prev_round.
+        // Edges = all hash-committed hashes from prev_round. O(n_per_round) via index.
         let edges: Vec<VertexHash> = self
-            .hash_committed
-            .iter()
-            .filter(|((r, _), _)| *r == prev_round)
-            .map(|(_, h)| h.clone())
-            .collect();
+            .hash_committed_by_round
+            .get(&prev_round)
+            .map_or_else(Vec::new, |sources| {
+                sources.iter()
+                    .filter_map(|&src| self.hash_committed.get(&(prev_round, src)).cloned())
+                    .collect()
+            });
 
         // Sailfish rule: include TC if leader is not hash-committed.
         let tc = if !self.has_leader_hash_committed(prev_round) {
@@ -381,6 +388,7 @@ impl PRBCSailfish {
             self.environment.my_node.id, round, source
         );
         self.hash_committed.insert((round, source), hash.clone());
+        self.hash_committed_by_round.entry(round).or_default().insert(source);
 
         // Hash Override: if this is the round leader, suspend the timeout timer.
         let leader_id = (round % self.environment.nodes.len() as u64) as NodeId;
@@ -484,17 +492,19 @@ impl PRBCSailfish {
             };
 
             // Count round-(r+1) vertices whose known edges include leader_hash.
+            // Uses the per-round index for O(n_per_round) instead of O(total) scan.
             let next_round = r + 1;
             let votes = self
-                .hash_committed
-                .iter()
-                .filter(|((rr, _), _)| *rr == next_round)
-                .filter(|((_, _), child_hash)| {
-                    self.known_edges
-                        .get(*child_hash)
-                        .map_or(false, |edges| edges.contains(&leader_hash))
-                })
-                .count();
+                .hash_committed_by_round
+                .get(&next_round)
+                .map_or(0, |sources| {
+                    sources.iter().filter(|&&src| {
+                        self.hash_committed
+                            .get(&(next_round, src))
+                            .and_then(|h| self.known_edges.get(h))
+                            .map_or(false, |edges| edges.contains(&leader_hash))
+                    }).count()
+                });
 
             if votes >= 2 * self.f + 1 {
                 if !self.already_ordered.contains(&leader_hash) {
@@ -932,6 +942,7 @@ impl PRBCSailfish {
 
         // Pre-populate PRBC state so round-1 vertex creation finds genesis.
         self.hash_committed.insert((0, 0), genesis_hash.clone());
+        self.hash_committed_by_round.entry(0).or_default().insert(0);
         self.execution_ready.insert(genesis_hash.clone());
         self.known_edges.insert(genesis_hash.clone(), vec![]);
         self.prbc_payloads.insert(genesis_hash, genesis);
