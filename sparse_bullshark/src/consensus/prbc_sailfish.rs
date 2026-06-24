@@ -100,6 +100,10 @@ pub struct PRBCSailfish {
     vertex_timestamps: HashMap<VertexHash, Instant>,
     total_commit_latency_us: u128,
     committed_vertex_count: u64,
+
+    // Diagnostic counters (printed in stats, medianised by run_linux.py)
+    recovery_triggered_count: usize, // Phase 3 recovery started (no payload at hash-quorum)
+    race_condition_count: usize,     // propose arrived after hash_committed was already set
 }
 
 impl PRBCSailfish {
@@ -145,6 +149,9 @@ impl PRBCSailfish {
             vertex_timestamps: HashMap::new(),
             total_commit_latency_us: 0,
             committed_vertex_count: 0,
+
+            recovery_triggered_count: 0,
+            race_condition_count: 0,
         };
         node.add_genesis_block();
         node
@@ -422,6 +429,7 @@ impl PRBCSailfish {
             self.on_execution_ready(hash.clone(), full_vertex, dispatcher_tx).await;
         } else if source != self.environment.my_node.id {
             // Start Phase 3 recovery: we have 2f+1 votes but no payload.
+            self.recovery_triggered_count += 1;
             let vote_list: Vec<NodeId> = votes.iter().cloned().collect();
             self.start_recovery(hash.clone(), vote_list);
         }
@@ -443,15 +451,11 @@ impl PRBCSailfish {
         self.execution_ready.insert(hash.clone());
 
         // Fill the skeleton in DAG with real block and edges.
+        // PRBC only accesses dag.vertices (never dag.rounds), so we skip
+        // the O(n) linear scan over dag.rounds that Sailfish uses.
         if let Some(entry) = self.dag.vertices.get_mut(&hash) {
             entry.block = vertex.block.clone();
             entry.edges = vertex.edges.clone();
-        }
-        if let Some(round_verts) = self.dag.rounds.get_mut(&vertex.round) {
-            if let Some(v) = round_verts.iter_mut().find(|v| v.hash == hash) {
-                v.block = vertex.block.clone();
-                v.edges = vertex.edges.clone();
-            }
         }
 
         // Record edges for commit counting and causal traversal.
@@ -566,13 +570,11 @@ impl PRBCSailfish {
     ) {
         let hash = vertex.hash.clone();
 
-        // Idempotent: if we've already processed this exact propose, bail out.
-        // Without this guard every duplicate (from S1/S2 forwarding) would
-        // re-forward to S2 and re-broadcast a vote, creating an exponential
-        // message flood that starves the network.
-        if self.prbc_payloads.contains_key(&hash)
-            || self.hash_committed.contains_key(&(vertex.round, vertex.source))
-        {
+        // Payload already stored or fully execution-ready — nothing to do.
+        // This guards against duplicate proposes (S1→S2 forwarding) without
+        // accidentally dropping a late-arriving propose that carries a payload
+        // we still need.
+        if self.prbc_payloads.contains_key(&hash) || self.execution_ready.contains(&hash) {
             return;
         }
 
@@ -590,10 +592,22 @@ impl PRBCSailfish {
             return;
         }
 
-        // Store payload — only reached once per (round, source, hash).
+        // Store payload and edges (first time we see this propose).
         self.known_edges.insert(hash.clone(), vertex.edges.clone());
         self.prbc_payloads.insert(hash.clone(), vertex.clone());
 
+        // Race-condition fast path: hash quorum already reached before propose arrived.
+        // This happens on fast machines where tiny vote messages (20 B) outrace the
+        // 256 KB propose in the message_rx queue. The vote was already broadcast by
+        // whoever triggered on_hash_quorum, so we only need to mark execution-ready
+        // and let the commit pipeline proceed — no vote needed here.
+        if self.hash_committed.contains_key(&(vertex.round, vertex.source)) {
+            self.race_condition_count += 1;
+            self.on_execution_ready(hash, vertex, dispatcher_tx).await;
+            return;
+        }
+
+        // Normal path: propose arrived before hash quorum.
         // Sample verification: am I in S1?
         if self.sample_verification(vertex.round, vertex.source) {
             let my_id = self.environment.my_node.id;
@@ -1312,5 +1326,7 @@ impl PRBCSailfish {
         println!("  Consensus latency:    {:.1} ms", avg_latency_ms);
         println!("  Execution TPS:        {:.0} tx/s", exe_tps);
         println!("  Execution BPS:        {:.0} B/s", exe_bps);
+        println!("  Phase-3 recoveries:   {}", self.recovery_triggered_count);
+        println!("  Race cond. hits:      {}", self.race_condition_count);
     }
 }

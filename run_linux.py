@@ -205,6 +205,8 @@ async def main():
                         help="sailfish = Sailfish (Standard RBC), prbc_sailfish = PRBC-Sailfish")
     parser.add_argument("--input-rate", type=int, default=0,
                         help="Input rate in tx/s (0 = unlimited)")
+    parser.add_argument("--logs", action="store_true",
+                        help="Print captured stderr (warn/error logs) from each node after results")
     args = parser.parse_args()
 
     for path in [KEYS_FILE, NODES_CSV]:
@@ -292,6 +294,15 @@ async def main():
         sys.exit(1)
 
     print_summary(all_configs[0], compute_median(all_results), len(all_results))
+
+    if args.logs:
+        print("--------------------------------------------------")
+        print(" NODE LOGS (stderr)")
+        print("--------------------------------------------------")
+        for i, buf in enumerate(stderr_bufs):
+            if buf:
+                print(f"\n--- Node {nodes[i]['id']} ---")
+                print("\n".join(buf))
 
 
 if __name__ == "__main__":
