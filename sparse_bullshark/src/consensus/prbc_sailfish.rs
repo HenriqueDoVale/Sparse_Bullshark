@@ -104,6 +104,9 @@ pub struct PRBCSailfish {
     // Diagnostic counters (printed in stats, medianised by run_linux.py)
     recovery_triggered_count: usize, // Phase 3 recovery started (no payload at hash-quorum)
     race_condition_count: usize,     // propose arrived after hash_committed was already set
+
+    // Whether to sign and verify PRBC vote messages (enabled via PRBC_SIGS=on)
+    sign_votes: bool,
 }
 
 impl PRBCSailfish {
@@ -152,6 +155,8 @@ impl PRBCSailfish {
 
             recovery_triggered_count: 0,
             race_condition_count: 0,
+
+            sign_votes: std::env::var("PRBC_SIGS").as_deref() != Ok("off"),
         };
         node.add_genesis_block();
         node
@@ -639,9 +644,13 @@ impl PRBCSailfish {
             }
         }
 
-        // Every node broadcasts a vote on hash(v). No per-message signature —
-        // the TCP transport handshake already authenticates the sender.
+        // Broadcast vote. When sign_votes is on, include an Ed25519 sig over the hash.
         let my_id = self.environment.my_node.id;
+        let signature = if self.sign_votes {
+            self.private_key.sign(&hash).to_bytes().to_vec()
+        } else {
+            vec![]
+        };
         let _ = dispatcher_tx
             .send((
                 None,
@@ -649,6 +658,8 @@ impl PRBCSailfish {
                     round: vertex.round,
                     source: vertex.source,
                     hash: hash.clone(),
+                    voter: my_id,
+                    signature,
                 }),
             ))
             .await;
@@ -660,16 +671,40 @@ impl PRBCSailfish {
 
     async fn handle_prbc_vote(
         &mut self,
-        sender: NodeId, // authenticated by TCP handshake — used as voter identity
+        sender: NodeId,
         vote: PRBCVoteMessage,
         dispatcher_tx: &Sender<DispatchMsg>,
     ) {
+        // When signing is on, verify the Ed25519 signature and use msg.voter as identity.
+        // When off, fall back to the TCP-authenticated sender.
+        let voter = if self.sign_votes {
+            if vote.signature.is_empty() {
+                warn!("[Node {}] PRBC: vote from {} missing signature (PRBC_SIGS=on)",
+                    self.environment.my_node.id, sender);
+                return;
+            }
+            match self.public_keys.get(&vote.voter).and_then(|pk| {
+                Signature::from_bytes(&vote.signature).ok().and_then(|sig| {
+                    pk.verify(&vote.hash, &sig).ok()
+                })
+            }) {
+                Some(_) => vote.voter,
+                None => {
+                    warn!("[Node {}] PRBC: invalid vote signature from node {}",
+                        self.environment.my_node.id, sender);
+                    return;
+                }
+            }
+        } else {
+            sender
+        };
+
         debug!(
             "[Node {}] PRBCVote received: round={} source={} voter={}",
-            self.environment.my_node.id, vote.round, vote.source, sender
+            self.environment.my_node.id, vote.round, vote.source, voter
         );
 
-        self.record_vote(sender, vote.round, vote.source, vote.hash, dispatcher_tx)
+        self.record_vote(voter, vote.round, vote.source, vote.hash, dispatcher_tx)
             .await;
     }
 
@@ -1302,25 +1337,30 @@ impl PRBCSailfish {
         let exe_bps   = exe_bytes as f64 / exec_secs;
         let rps       = self.last_ordered_round as f64 / exec_secs;
 
-        println!("\n+ CONFIG:");
-        println!("  Protocol:             PRBC-Sailfish");
-        println!("  Faults:               {} node(s)", f_actual);
-        println!("  Fault tolerance:      {} node(s)", f_tolerance);
-        println!("  Committee size:       {} node(s)", n);
-        println!("  Transaction size:     {} B", tx_size);
-        println!("  Transactions/block:   {}", n_tx);
-        println!("  Block size:           {} B", n_tx * tx_size);
-        println!("  Input rate:           {} tx/s", if self.environment.input_rate == 0 { "unlimited".to_string() } else { self.environment.input_rate.to_string() });
-        println!("  Execution time:       {} s", EXECUTION_DURATION);
-        println!("\n+ RESULTS:");
-        println!("  Ordered rounds:       {}", self.last_ordered_round);
-        println!("  Consensus committed:  {}", self.consensus_committed_count);
-        println!("  Execution finalized:  {}", self.finalized_block_count);
-        println!("  Rounds/s:             {:.1}", rps);
+        let sigs_label  = if self.sign_votes { "on" } else { "off" };
+        let rate_label  = if self.environment.input_rate == 0 {
+            "unlimited".to_string()
+        } else {
+            format!("{} tx/s", self.environment.input_rate)
+        };
         let avg_latency_ms = if self.committed_vertex_count > 0 {
             (self.total_commit_latency_us as f64 / self.committed_vertex_count as f64) / 1000.0
         } else { 0.0 };
 
+        println!("\n+ CONFIG:");
+        println!("  Protocol:             PRBC-Sailfish (vote sigs: {})", sigs_label);
+        println!("  Faults:               {} node(s)", f_actual);
+        println!("  Fault tolerance:      {} node(s)", f_tolerance);
+        println!("  Committee size:       {} node(s)", n);
+        println!("  Input rate:           {}", rate_label);
+        println!("  Transaction size:     {} B", tx_size);
+        println!("  Transactions/block:   {}", n_tx);
+        println!("  Block size:           {} B", n_tx * tx_size);
+        println!("  Execution time:       {} s", EXECUTION_DURATION);
+        println!("\n+ RESULTS:");
+        println!("  Ordered rounds:       {}", self.last_ordered_round);
+        println!("  Blocks finalized:     {}", self.finalized_block_count);
+        println!("  Rounds/s:             {:.1}", rps);
         println!("  Consensus TPS:        {:.0} tx/s", con_tps);
         println!("  Consensus BPS:        {:.0} B/s", con_bps);
         println!("  Consensus latency:    {:.1} ms", avg_latency_ms);

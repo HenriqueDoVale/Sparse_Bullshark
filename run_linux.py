@@ -155,7 +155,7 @@ def print_summary(config, results, n_nodes):
 
 # ── Node runner ───────────────────────────────────────────────────────────────
 
-async def run_node(node_id, tx_size, n_tx, mode, input_rate, private_key,
+async def run_node(node_id, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, private_key,
                    stdout_buf, stderr_buf, procs):
     env = os.environ.copy()
     env[f"PRIVATE_KEY_{node_id}"] = private_key
@@ -163,6 +163,10 @@ async def run_node(node_id, tx_size, n_tx, mode, input_rate, private_key,
     env["RUST_LOG"] = "warn"
     if input_rate > 0:
         env["INPUT_RATE"] = str(input_rate)
+    if mode == "sailfish":
+        env["RBC_MODE"] = rbc
+    if mode == "prbc_sailfish" and no_prbc_sigs:
+        env["PRBC_SIGS"] = "off"
 
     proc = await asyncio.create_subprocess_exec(
         BINARY, str(node_id), str(tx_size), str(n_tx),
@@ -205,6 +209,10 @@ async def main():
                         help="sailfish = Sailfish (Standard RBC), prbc_sailfish = PRBC-Sailfish")
     parser.add_argument("--input-rate", type=int, default=0,
                         help="Input rate in tx/s (0 = unlimited)")
+    parser.add_argument("--rbc", choices=["bracha", "signed_vote"], default="bracha",
+                        help="RBC variant for Sailfish (bracha or signed_vote; ignored for prbc_sailfish)")
+    parser.add_argument("--no-prbc-sigs", action="store_true",
+                        help="Disable Ed25519 vote signatures in PRBC-Sailfish (ignored for sailfish)")
     parser.add_argument("--logs", action="store_true",
                         help="Print captured stderr (warn/error logs) from each node after results")
     args = parser.parse_args()
@@ -235,7 +243,8 @@ async def main():
     print("--------------------------------------------------")
     print(" STARTING EXPERIMENT")
     print("--------------------------------------------------")
-    print(f"  Protocol:   {args.mode.replace('_', '-').upper()}")
+    rbc_suffix = f" [{args.rbc}]" if args.mode == "sailfish" else ""
+    print(f"  Protocol:   {args.mode.replace('_', '-').upper()}{rbc_suffix}")
     print(f"  Tx size:    {args.tx_size} B")
     print(f"  Tx/block:   {args.n_tx}")
     print(f"  Nodes:      {len(nodes)}")
@@ -251,7 +260,7 @@ async def main():
         asyncio.create_task(
             run_node(
                 n["id"], args.tx_size, args.n_tx, args.mode,
-                args.input_rate, priv_keys[n["id"]],
+                args.input_rate, args.rbc, args.no_prbc_sigs, priv_keys[n["id"]],
                 stdout_bufs[i], stderr_bufs[i], procs
             )
         )

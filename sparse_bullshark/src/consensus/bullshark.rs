@@ -196,12 +196,9 @@ impl Bullshark {
                             SparseMessage::RBCReady(ready) => {
                                 self.handle_rbc_ready(sender_id, ready, &dispatcher_tx).await;
                             },
-                            SparseMessage::Commit(_) => {
-                                // Handle commits if you use them
-                            }
-                            SparseMessage::Timeout(_)=>{
-                                
-                            }
+                            SparseMessage::Commit(_) => {}
+                            SparseMessage::Timeout(_) => {}
+                            SparseMessage::RBCVote(_) | SparseMessage::RBCCommit(_) => {}
                         }
                     }
                     Err(_) => {
