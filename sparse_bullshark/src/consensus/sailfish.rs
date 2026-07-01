@@ -32,9 +32,6 @@ const SOCKET_BINDING_DELAY: u64 = 2;
 const MESSAGE_BYTES_LENGTH: usize = 4;
 const EXECUTION_DURATION: u64 = 60;
 
-// SAILFISH CONSTANT: "Wait for leader until a timeout occurs"
-const ROUND_TIMEOUT_MS: u128 = 500;
-
 // Dispatcher channel: None = broadcast to all; Some(id) = unicast to that peer.
 type SailDispatch = (Option<NodeId>, SparseMessage);
 
@@ -84,6 +81,9 @@ pub struct Sailfish {
     vertex_timestamps: HashMap<VertexHash, Instant>,
     total_commit_latency_us: u128,
     committed_vertex_count: u64,
+
+    // Configurable round timeout (ms), read from ROUND_TIMEOUT_MS env var
+    round_timeout_ms: u128,
 }
 
 impl Sailfish {
@@ -133,6 +133,9 @@ impl Sailfish {
             vertex_timestamps: HashMap::new(),
             total_commit_latency_us: 0,
             committed_vertex_count: 0,
+
+            round_timeout_ms: std::env::var("ROUND_TIMEOUT_MS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
         };
         node.add_genesis_block();
         node
@@ -257,7 +260,7 @@ impl Sailfish {
         // RED LIGHT: We are stuck waiting for leader of prev_round. Check if we should timeout.
         if !self.timeout_sent {
             let elapsed = self.round_start_time.elapsed().as_millis();
-            if elapsed > ROUND_TIMEOUT_MS {
+            if elapsed > self.round_timeout_ms {
                 warn!("[Node {}] Timeout waiting for Leader in Round {}. Broadcasting TIMEOUT.", self.environment.my_node.id, prev_round);
                 
                 // Create Timeout Signature for prev_round

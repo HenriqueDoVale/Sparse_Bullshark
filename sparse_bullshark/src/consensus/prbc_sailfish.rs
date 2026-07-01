@@ -35,8 +35,6 @@ const MESSAGE_BYTES_LENGTH: usize = 4;
 const EXECUTION_DURATION: u64 = 60;
 
 // ── Protocol constants ────────────────────────────────────────────────────────
-const ROUND_TIMEOUT_MS: u128 = 500;
-const RECOVERY_TIMEOUT_MS: u128 = 500;
 // Sample size = PRBC_C * sqrt(n), rounded up
 const PRBC_C: f64 = 1.4; // ceil(PRBC_C * sqrt(n)) ≈ 4 for n=8
 
@@ -107,6 +105,10 @@ pub struct PRBCSailfish {
 
     // Whether to sign and verify PRBC vote messages (enabled via PRBC_SIGS=on)
     sign_votes: bool,
+
+    // Configurable timeouts (ms), read from env vars ROUND_TIMEOUT_MS / RECOVERY_TIMEOUT_MS
+    round_timeout_ms: u128,
+    recovery_timeout_ms: u128,
 }
 
 impl PRBCSailfish {
@@ -157,6 +159,11 @@ impl PRBCSailfish {
             race_condition_count: 0,
 
             sign_votes: std::env::var("PRBC_SIGS").as_deref() != Ok("off"),
+
+            round_timeout_ms: std::env::var("ROUND_TIMEOUT_MS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
+            recovery_timeout_ms: std::env::var("RECOVERY_TIMEOUT_MS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
         };
         node.add_genesis_block();
         node
@@ -285,7 +292,7 @@ impl PRBCSailfish {
 
         if !self.timeout_sent {
             let elapsed = self.round_start_time.elapsed().as_millis();
-            if elapsed > ROUND_TIMEOUT_MS {
+            if elapsed > self.round_timeout_ms {
                 warn!(
                     "[Node {}] Timeout waiting for Leader in Round {}. Broadcasting TIMEOUT.",
                     self.environment.my_node.id, prev_round
@@ -790,7 +797,7 @@ impl PRBCSailfish {
                 state.next_idx += 1;
                 // Set sent_at far in the past to trigger retry immediately.
                 state.request_sent_at =
-                    Instant::now() - Duration::from_millis(RECOVERY_TIMEOUT_MS as u64 + 1);
+                    Instant::now() - Duration::from_millis(self.recovery_timeout_ms as u64 + 1);
             }
             return;
         }
@@ -817,7 +824,7 @@ impl PRBCSailfish {
             if let Some(state) = self.recovery_state.get_mut(&hash) {
                 state.next_idx += 1;
                 state.request_sent_at =
-                    Instant::now() - Duration::from_millis(RECOVERY_TIMEOUT_MS as u64 + 1);
+                    Instant::now() - Duration::from_millis(self.recovery_timeout_ms as u64 + 1);
             }
             return;
         }
@@ -848,7 +855,7 @@ impl PRBCSailfish {
                 vote_list,
                 next_idx: 0,
                 request_sent_at: Instant::now()
-                    - Duration::from_millis(RECOVERY_TIMEOUT_MS as u64 + 1),
+                    - Duration::from_millis(self.recovery_timeout_ms as u64 + 1),
             },
         );
     }
@@ -872,7 +879,7 @@ impl PRBCSailfish {
                 .map(|s| s.request_sent_at.elapsed().as_millis())
                 .unwrap_or(u128::MAX);
 
-            if elapsed < RECOVERY_TIMEOUT_MS {
+            if elapsed < self.recovery_timeout_ms {
                 continue; // Still waiting for a response.
             }
 
