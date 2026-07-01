@@ -445,6 +445,7 @@ impl Sailfish {
 
                                 self.finalized_block_count += committed_count;
                                 self.last_ordered_round = r;
+                                self.dag.prune(self.last_ordered_round.saturating_sub(4));
                             }
                         } else {
                             // Not enough votes yet. Check if more can still arrive.
@@ -457,6 +458,7 @@ impl Sailfish {
                                 warn!("[Node {}] Skipping stuck leader at round {} (leader={}, votes={}/{}, r+1 DAG={}/{})",
                                     self.environment.my_node.id, r, leader_id, votes, 2 * self.f + 1, r1_size, n);
                                 self.last_ordered_round = r;
+                                self.dag.prune(self.last_ordered_round.saturating_sub(4));
                                 // continue to next round
                             } else {
                                 break; // More votes may still arrive

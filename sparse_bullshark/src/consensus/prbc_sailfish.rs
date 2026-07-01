@@ -527,11 +527,29 @@ impl PRBCSailfish {
                     if let Some(leader_v) = self.dag.vertices.get(&leader_hash).cloned() {
                         self.commit_causal_history_prbc(leader_v);
                         self.last_ordered_round = r;
+                        self.dag.prune(self.last_ordered_round.saturating_sub(4));
+                        self.prune_prbc_caches();
                     }
                 }
             } else {
                 break;
             }
+        }
+    }
+
+    /// Prune payload and vote caches for rounds that are too old to need recovery.
+    /// Window of 50 rounds gives ~8 s at 6 rounds/s, enough for all recovery retries
+    /// (9 peers × 500 ms recovery timeout = 4.5 s worst case).
+    fn prune_prbc_caches(&mut self) {
+        let cutoff = self.last_ordered_round.saturating_sub(50);
+        let to_remove: Vec<VertexHash> = self.prbc_payloads
+            .iter()
+            .filter(|(_, v)| v.round < cutoff)
+            .map(|(h, _)| h.clone())
+            .collect();
+        for h in to_remove {
+            self.prbc_payloads.remove(&h);
+            self.prbc_votes.remove(&h);
         }
     }
 

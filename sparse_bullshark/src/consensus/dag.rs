@@ -22,6 +22,23 @@ impl DAG {
     pub fn get_round(&self, round : u64) -> Option<&Vec<Vertex>> {
             self.rounds.get(&round)
     }
+
+    /// Drop all rounds strictly below `before_round` from both indexes.
+    /// Call after updating `last_ordered_round` with a small safety window
+    /// (e.g. `last_ordered_round.saturating_sub(4)`) to bound memory usage.
+    pub fn prune(&mut self, before_round: u64) {
+        let to_remove: Vec<u64> = self.rounds.keys()
+            .filter(|&&r| r < before_round)
+            .cloned()
+            .collect();
+        for r in to_remove {
+            if let Some(vs) = self.rounds.remove(&r) {
+                for v in vs {
+                    self.vertices.remove(&v.hash);
+                }
+            }
+        }
+    }
     /* 
     pub fn get_vertices_by_sources(&self, round: u64, sources: &[NodeId]) -> Vec<Vertex> {
         let mut result = Vec::new();
