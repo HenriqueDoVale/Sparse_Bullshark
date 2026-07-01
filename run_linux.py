@@ -210,7 +210,7 @@ async def main():
                         help="sailfish = Sailfish (Standard RBC), prbc_sailfish = PRBC-Sailfish")
     parser.add_argument("--input-rate", type=int, default=0,
                         help="Input rate in tx/s (0 = unlimited)")
-    parser.add_argument("--rbc", choices=["bracha", "signed_vote"], default="bracha",
+    parser.add_argument("--rbc", choices=["bracha", "signed_vote"], default="signed_vote",
                         help="RBC variant for Sailfish (bracha or signed_vote; ignored for prbc_sailfish)")
     parser.add_argument("--no-prbc-sigs", action="store_true",
                         help="Disable Ed25519 vote signatures in PRBC-Sailfish (ignored for sailfish)")

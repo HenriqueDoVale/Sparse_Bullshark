@@ -38,20 +38,20 @@ EXPERIMENTS = [
     #   label        — short name shown in the results table
 
     # ── n=10, 3 interleaved pairs ────────────────────────────────────────────
-    {"n_nodes": 10, "tx_size": 512, "n_tx": 500, "mode": "sailfish",      "rbc": "bracha", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "Bracha n=10"},
-    {"n_nodes": 10, "tx_size": 512, "n_tx": 500, "mode": "prbc_sailfish", "rbc": "bracha", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "PRBC   n=10"},
-    {"n_nodes": 10, "tx_size": 512, "n_tx": 500, "mode": "sailfish",      "rbc": "bracha", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "Bracha n=10"},
-    {"n_nodes": 10, "tx_size": 512, "n_tx": 500, "mode": "prbc_sailfish", "rbc": "bracha", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "PRBC   n=10"},
-    {"n_nodes": 10, "tx_size": 512, "n_tx": 500, "mode": "sailfish",      "rbc": "bracha", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "Bracha n=10"},
-    {"n_nodes": 10, "tx_size": 512, "n_tx": 500, "mode": "prbc_sailfish", "rbc": "bracha", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "PRBC   n=10"},
+    {"n_nodes": 10, "tx_size": 512, "n_tx": 500, "mode": "sailfish",      "rbc": "signed_vote", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "SV     n=10"},
+    {"n_nodes": 10, "tx_size": 512, "n_tx": 500, "mode": "prbc_sailfish", "rbc": "signed_vote", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "PRBC   n=10"},
+    {"n_nodes": 10, "tx_size": 512, "n_tx": 500, "mode": "sailfish",      "rbc": "signed_vote", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "SV     n=10"},
+    {"n_nodes": 10, "tx_size": 512, "n_tx": 500, "mode": "prbc_sailfish", "rbc": "signed_vote", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "PRBC   n=10"},
+    {"n_nodes": 10, "tx_size": 512, "n_tx": 500, "mode": "sailfish",      "rbc": "signed_vote", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "SV     n=10"},
+    {"n_nodes": 10, "tx_size": 512, "n_tx": 500, "mode": "prbc_sailfish", "rbc": "signed_vote", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "PRBC   n=10"},
 
     # ── n=15, 3 interleaved pairs ────────────────────────────────────────────
-    {"n_nodes": 15, "tx_size": 512, "n_tx": 500, "mode": "sailfish",      "rbc": "bracha", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "Bracha n=15"},
-    {"n_nodes": 15, "tx_size": 512, "n_tx": 500, "mode": "prbc_sailfish", "rbc": "bracha", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "PRBC   n=15"},
-    {"n_nodes": 15, "tx_size": 512, "n_tx": 500, "mode": "sailfish",      "rbc": "bracha", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "Bracha n=15"},
-    {"n_nodes": 15, "tx_size": 512, "n_tx": 500, "mode": "prbc_sailfish", "rbc": "bracha", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "PRBC   n=15"},
-    {"n_nodes": 15, "tx_size": 512, "n_tx": 500, "mode": "sailfish",      "rbc": "bracha", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "Bracha n=15"},
-    {"n_nodes": 15, "tx_size": 512, "n_tx": 500, "mode": "prbc_sailfish", "rbc": "bracha", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "PRBC   n=15"},
+    {"n_nodes": 15, "tx_size": 512, "n_tx": 500, "mode": "sailfish",      "rbc": "signed_vote", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "SV     n=15"},
+    {"n_nodes": 15, "tx_size": 512, "n_tx": 500, "mode": "prbc_sailfish", "rbc": "signed_vote", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "PRBC   n=15"},
+    {"n_nodes": 15, "tx_size": 512, "n_tx": 500, "mode": "sailfish",      "rbc": "signed_vote", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "SV     n=15"},
+    {"n_nodes": 15, "tx_size": 512, "n_tx": 500, "mode": "prbc_sailfish", "rbc": "signed_vote", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "PRBC   n=15"},
+    {"n_nodes": 15, "tx_size": 512, "n_tx": 500, "mode": "sailfish",      "rbc": "signed_vote", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "SV     n=15"},
+    {"n_nodes": 15, "tx_size": 512, "n_tx": 500, "mode": "prbc_sailfish", "rbc": "signed_vote", "no_prbc_sigs": False, "input_rate": 0, "timeout_ms": 500, "label": "PRBC   n=15"},
 ]
 
 # Network settings used when regenerating nodes.csv
