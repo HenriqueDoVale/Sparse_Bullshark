@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use crate::types::vertex::{NodeId, Vertex, VertexHash};
 use crate::network::message::TimeoutMessage;
@@ -26,11 +27,13 @@ pub struct PRBCRecoveryMessage {
     pub requester: NodeId,
 }
 
-/// Phase 3 response: payload + the voter IDs that formed the quorum.
+/// Phase 3 response: payload + the full vote certificate (voter → Ed25519 sig).
+/// When PRBC_SIGS=on the receiver verifies each signature independently.
+/// When PRBC_SIGS=off signatures are empty vecs and TCP-auth cross-reference is used.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PRBCRecoveryRespMessage {
     pub vertex: Vertex,
-    pub voters: Vec<NodeId>,
+    pub votes: BTreeMap<NodeId, Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

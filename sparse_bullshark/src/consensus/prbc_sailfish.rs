@@ -66,7 +66,7 @@ pub struct PRBCSailfish {
 
     // ── PRBC control plane ───────────────────────────────────────────────────
     // hash → set of voter IDs (authenticated via TCP transport, no per-message sig)
-    prbc_votes: HashMap<VertexHash, HashSet<NodeId>>,
+    prbc_votes: HashMap<VertexHash, BTreeMap<NodeId, Vec<u8>>>,
     // (round, source) → vertex_hash; set when 2f+1 votes accumulate
     hash_committed: HashMap<(u64, NodeId), VertexHash>,
     // O(1) index: round → set of sources that are hash-committed in that round.
@@ -395,7 +395,7 @@ impl PRBCSailfish {
         round: u64,
         source: NodeId,
         hash: VertexHash,
-        votes: HashSet<NodeId>,
+        votes: BTreeMap<NodeId, Vec<u8>>,
         dispatcher_tx: &Sender<DispatchMsg>,
     ) {
         // Dedup
@@ -442,7 +442,7 @@ impl PRBCSailfish {
         } else if source != self.environment.my_node.id {
             // Start Phase 3 recovery: we have 2f+1 votes but no payload.
             self.recovery_triggered_count += 1;
-            let vote_list: Vec<NodeId> = votes.iter().cloned().collect();
+            let vote_list: Vec<NodeId> = votes.keys().cloned().collect();
             self.start_recovery(hash.clone(), vote_list);
         }
 
@@ -671,7 +671,7 @@ impl PRBCSailfish {
 
         // Broadcast vote. When sign_votes is on, include an Ed25519 sig over the hash.
         let my_id = self.environment.my_node.id;
-        let signature = if self.sign_votes {
+        let my_sig = if self.sign_votes {
             self.private_key.sign(&hash).to_bytes().to_vec()
         } else {
             vec![]
@@ -684,13 +684,13 @@ impl PRBCSailfish {
                     source: vertex.source,
                     hash: hash.clone(),
                     voter: my_id,
-                    signature,
+                    signature: my_sig.clone(),
                 }),
             ))
             .await;
 
         // Count own vote locally.
-        self.record_vote(my_id, vertex.round, vertex.source, hash, dispatcher_tx)
+        self.record_vote(my_id, my_sig, vertex.round, vertex.source, hash, dispatcher_tx)
             .await;
     }
 
@@ -729,7 +729,7 @@ impl PRBCSailfish {
             self.environment.my_node.id, vote.round, vote.source, voter
         );
 
-        self.record_vote(voter, vote.round, vote.source, vote.hash, dispatcher_tx)
+        self.record_vote(voter, vote.signature, vote.round, vote.source, vote.hash, dispatcher_tx)
             .await;
     }
 
@@ -738,6 +738,7 @@ impl PRBCSailfish {
     async fn record_vote(
         &mut self,
         voter: NodeId,
+        sig: Vec<u8>,
         round: u64,
         source: NodeId,
         hash: VertexHash,
@@ -748,7 +749,7 @@ impl PRBCSailfish {
         }
 
         let votes = self.prbc_votes.entry(hash.clone()).or_default();
-        votes.insert(voter);
+        votes.insert(voter, sig);
         let quorum = 2 * self.f + 1;
 
         debug!(
@@ -779,7 +780,7 @@ impl PRBCSailfish {
                             Some(msg.requester),
                             PRBCMessage::PRBCRecoveryResp(PRBCRecoveryRespMessage {
                                 vertex,
-                                voters: votes.iter().cloned().collect(),
+                                votes: votes.clone(),
                             }),
                         ))
                         .await;
@@ -820,24 +821,36 @@ impl PRBCSailfish {
             return;
         }
 
-        // Verify vote quorum.
+        // Verify vote quorum certificate.
         let quorum = 2 * self.f + 1;
-        if msg.voters.len() < quorum {
+        if msg.votes.len() < quorum {
             warn!(
                 "[Node {}] Recovery resp from {}: insufficient votes ({})",
-                self.environment.my_node.id, sender, msg.voters.len()
+                self.environment.my_node.id, sender, msg.votes.len()
             );
             return;
         }
 
-        // Cross-reference: count voters in response that we also received votes from.
-        // Since honest nodes broadcast votes to all, overlap must be at least f+1.
-        let my_votes = self.prbc_votes.get(&hash).cloned().unwrap_or_default();
-        let overlap = msg.voters.iter().filter(|v| my_votes.contains(v)).count();
-        if overlap < self.f + 1 {
+        // When vote signatures are enabled, verify each one cryptographically —
+        // the certificate is self-contained and does not rely on local state.
+        // When disabled, fall back to cross-referencing with TCP-authenticated votes.
+        let cert_valid = if self.sign_votes {
+            let valid = msg.votes.iter().filter(|(voter_id, sig)| {
+                self.public_keys.get(voter_id)
+                    .and_then(|pk| Signature::from_bytes(sig).ok().map(|s| (pk, s)))
+                    .map_or(false, |(pk, s)| pk.verify(&hash, &s).is_ok())
+            }).count();
+            valid >= quorum
+        } else {
+            let my_votes = self.prbc_votes.get(&hash).cloned().unwrap_or_default();
+            let overlap = msg.votes.keys().filter(|v| my_votes.contains_key(v)).count();
+            overlap >= self.f + 1
+        };
+
+        if !cert_valid {
             warn!(
-                "[Node {}] Recovery resp from {}: voter overlap too low ({}/{}), trying next",
-                self.environment.my_node.id, sender, overlap, self.f + 1
+                "[Node {}] Recovery resp from {}: invalid vote certificate, trying next",
+                self.environment.my_node.id, sender
             );
             if let Some(state) = self.recovery_state.get_mut(&hash) {
                 state.next_idx += 1;
