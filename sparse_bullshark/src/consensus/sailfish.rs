@@ -527,6 +527,7 @@ impl Sailfish {
         // Spawn parallel transaction generator
         let tx_size    = self.environment.transaction_size;
         let n_tx       = self.environment.n_transactions;
+        let n_nodes    = self.environment.nodes.len() as u64;
         let input_rate = self.environment.input_rate;
         let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
         self.batch_receiver = Some(batch_rx);
@@ -534,7 +535,8 @@ impl Sailfish {
         tokio::spawn(async move {
             let mut gen = TransactionGenerator::new(tx_size, n_tx);
             if input_rate > 0 {
-                let interval_us = (n_tx as u64 * 1_000_000) / input_rate;
+                let per_node_rate = input_rate / n_nodes;
+                let interval_us = (n_tx as u64 * 1_000_000) / per_node_rate;
                 let mut ticker = tokio::time::interval(Duration::from_micros(interval_us));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
