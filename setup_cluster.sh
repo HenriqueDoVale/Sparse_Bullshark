@@ -44,7 +44,7 @@ for MACHINE in "${MACHINES[@]}"; do
     IP="${MACHINE_IPS[$MACHINE]}"
     for ((p=0; p<NODES_PER_MACHINE; p++)); do
         echo "$node_id,$IP,$((8000+p)),ok" >> "$DIST_CSV"
-        ((node_id++))
+        node_id=$((node_id + 1))
     done
 done
 total_nodes=$node_id
