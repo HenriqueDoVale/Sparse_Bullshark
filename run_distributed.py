@@ -24,19 +24,11 @@ from collections import defaultdict
 
 KEYS_FILE  = "./keys"
 NODES_CSV  = "./shared/nodes_distributed.csv"
-ZONE       = "europe-west4-a"
 WORK_DIR   = "~/Sparse_Bullshark"
 BINARY     = "./target/release/sparse_bullshark"
-
-# Internal IP → GCP instance name (must match setup_cluster.sh)
-IP_TO_INSTANCE = {
-    "10.164.0.12": "node-0",
-    "10.164.0.6":  "node-1",
-    "10.164.0.11": "node-2",
-    "10.164.0.8":  "node-3",
-    "10.164.0.9":  "node-4",
-    "10.164.0.10": "node-5",
-}
+SSH_USER   = "henriquecostavale"
+SSH_KEY    = os.path.expanduser("~/.ssh/google_compute_engine")
+SSH_OPTS   = ["-i", SSH_KEY, "-o", "StrictHostKeyChecking=no", "-o", "LogLevel=ERROR"]
 
 # ── File readers ───────────────────────────────────────────────────────────────
 
@@ -118,14 +110,10 @@ def build_remote_script(node_ids, priv_keys, tx_size, n_tx, mode, input_rate, rb
 
 # ── SSH runner ─────────────────────────────────────────────────────────────────
 
-async def run_on_machine(instance, script, timeout_secs):
-    """SSH into a GCP instance and run script via stdin."""
+async def run_on_machine(ip, script, timeout_secs):
+    """SSH into a machine by internal IP and run script via stdin."""
     proc = await asyncio.create_subprocess_exec(
-        "gcloud", "compute", "ssh", instance,
-        "--zone", ZONE,
-        "--ssh-flag=-o StrictHostKeyChecking=no",
-        "--ssh-flag=-o LogLevel=ERROR",
-        "--", "bash", "-s",
+        "ssh", *SSH_OPTS, f"{SSH_USER}@{ip}", "bash", "-s",
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -141,7 +129,7 @@ async def run_on_machine(instance, script, timeout_secs):
             proc.kill()
         except OSError:
             pass
-        return "", f"[{instance}] timed out after {timeout_secs}s\n", -1
+        return "", f"[{ip}] timed out after {timeout_secs}s\n", -1
 
 
 # ── Output parsing ─────────────────────────────────────────────────────────────
@@ -229,11 +217,6 @@ async def main():
               file=sys.stderr)
         sys.exit(1)
 
-    for ip in groups:
-        if ip not in IP_TO_INSTANCE:
-            print(f"Error: no GCP instance mapped for IP {ip}. Update IP_TO_INSTANCE.", file=sys.stderr)
-            sys.exit(1)
-
     print("--------------------------------------------------")
     print(" STARTING DISTRIBUTED EXPERIMENT")
     print("--------------------------------------------------")
@@ -254,13 +237,12 @@ async def main():
     machine_order = []
     tasks = []
     for ip, node_ids in groups.items():
-        instance = IP_TO_INSTANCE[ip]
         script = build_remote_script(
             node_ids, priv_keys, args.tx_size, args.n_tx,
             args.mode, args.input_rate, args.rbc, args.no_prbc_sigs,
         )
-        machine_order.append((instance, node_ids))
-        tasks.append(asyncio.create_task(run_on_machine(instance, script, timeout_secs)))
+        machine_order.append((ip, node_ids))
+        tasks.append(asyncio.create_task(run_on_machine(ip, script, timeout_secs)))
 
     raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -268,20 +250,20 @@ async def main():
     all_configs, all_results = [], []
     all_stderr = {}
 
-    for (instance, node_ids), result in zip(machine_order, raw_results):
+    for (ip, node_ids), result in zip(machine_order, raw_results):
         if isinstance(result, Exception):
-            print(f"Warning: {instance} raised exception: {result}", file=sys.stderr)
+            print(f"Warning: {ip} raised exception: {result}", file=sys.stderr)
             continue
 
         stdout, stderr, rc = result
-        all_stderr[instance] = stderr
+        all_stderr[ip] = stderr
 
         if rc != 0:
-            print(f"Warning: {instance} exited with code {rc}", file=sys.stderr)
+            print(f"Warning: {ip} exited with code {rc}", file=sys.stderr)
 
         node_blocks = split_node_outputs(stdout)
         if not node_blocks:
-            print(f"Warning: {instance} produced no parseable output.", file=sys.stderr)
+            print(f"Warning: {ip} produced no parseable output.", file=sys.stderr)
             print(f"  Last stderr: {stderr.splitlines()[-5:] if stderr else '(empty)'}", file=sys.stderr)
             continue
 
@@ -291,7 +273,7 @@ async def main():
                 all_configs.append(cfg)
                 all_results.append(res)
             else:
-                print(f"Warning: a node on {instance} produced incomplete output.", file=sys.stderr)
+                print(f"Warning: a node on {ip} produced incomplete output.", file=sys.stderr)
 
     if not all_results:
         print("No results to display — all nodes failed or produced no output.", file=sys.stderr)
@@ -304,9 +286,9 @@ async def main():
         print("--------------------------------------------------")
         print(" MACHINE LOGS (stderr)")
         print("--------------------------------------------------")
-        for instance, stderr in all_stderr.items():
+        for ip, stderr in all_stderr.items():
             if stderr.strip():
-                print(f"\n--- {instance} ---")
+                print(f"\n--- {ip} ---")
                 print(stderr)
 
 
