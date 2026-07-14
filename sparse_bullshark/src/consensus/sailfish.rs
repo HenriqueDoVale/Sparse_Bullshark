@@ -11,19 +11,12 @@ use tokio::{
 use shared::{domain::{environment::Environment, node::NodeBehavior}, transaction_generator::TransactionGenerator};
 use crate::{
     consensus::dag::DAG,
+    consensus::rbc::{ReliableBroadcast, TupleDispatcher, bracha::BrachaRbc, signed_vote::SignedVoteRbc},
     network::{broadcast::generate_nonce, message::{
         SparseMessage, VertexMessage, TimeoutMessage,
-        RBCVoteMessage, RBCCommitMessage,
     }},
     types::vertex::{NodeId, Vertex, VertexHash, TimeoutCertificate},
 };
-
-/// Which RBC variant Sailfish uses for vertex broadcast.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum RbcMode {
-    Bracha,
-    SignedVote,
-}
 
 const NONCE_BYTES_LENGTH: usize = 32;
 const SIGNATURE_BYTES_LENGTH: usize = 64;
@@ -43,8 +36,9 @@ pub struct Sailfish {
     batch_receiver: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
     private_key: Arc<Keypair>,
 
-    // Which RBC variant is active.
-    rbc_mode: RbcMode,
+    // Which RBC implementation is active (Bracha or Signed-Vote, chosen via
+    // RBC_MODE at construction). All RBC-specific state now lives inside it.
+    rbc: Box<dyn ReliableBroadcast>,
 
     // --- Sailfish Specific State ---
     round: u64,
@@ -56,19 +50,6 @@ pub struct Sailfish {
 
     // The TC we formed for the PREVIOUS round (round - 1).
     current_round_tc: Option<TimeoutCertificate>,
-
-    // --- Bracha RBC state (used when rbc_mode == Bracha) ---
-    pub echo_counts:          HashMap<VertexHash, HashSet<NodeId>>,
-    pub ready_counts:         HashMap<VertexHash, HashSet<NodeId>>,
-    pub pending_rbc_vertices: HashMap<VertexHash, Vertex>,
-
-    // --- Signed-Vote RBC state (used when rbc_mode == SignedVote) ---
-    rbc_votes:        HashMap<VertexHash, BTreeMap<NodeId, Vec<u8>>>, // voter → signature
-    rbc_vertex_store: HashMap<VertexHash, Vertex>,   // body from Propose or Vote
-    rbc_commit_sent:  HashSet<VertexHash>,           // dedup: only broadcast Commit once
-
-    // --- Shared delivery state ---
-    pub delivered_vertices: HashSet<VertexHash>,
 
     // --- Standard Fields ---
     pub last_ordered_round: u64,
@@ -91,6 +72,16 @@ impl Sailfish {
         println!("Sailfish");
         let n = environment.nodes.len();
         let f = (n.saturating_sub(1)) / 3;
+        let my_id = environment.my_node.id;
+        let private_key = Arc::new(private_key);
+
+        // Choice of the rbc plugin - Only place that still knows Bracha and Signed Vote 
+        let rbc: Box<dyn ReliableBroadcast> = match std::env::var("RBC_MODE").as_deref() {
+            Ok("signed_vote") => Box::new(SignedVoteRbc::new(
+                my_id, f, private_key.clone(), public_keys.clone(),
+            )),
+            _ => Box::new(BrachaRbc::new(my_id, f, environment.my_node.behavior.clone())),
+        };
 
         let mut node = Sailfish {
             environment,
@@ -98,7 +89,8 @@ impl Sailfish {
             f,
             public_keys,
             batch_receiver: None,
-            private_key: Arc::new(private_key),
+            private_key,
+            rbc,
             
             // Sailfish Init
             round: 1,
@@ -107,28 +99,12 @@ impl Sailfish {
             timeout_store: HashMap::new(),
             current_round_tc: None,
 
-            rbc_mode: {
-                match std::env::var("RBC_MODE").as_deref() {
-                    Ok("signed_vote") => RbcMode::SignedVote,
-                    _ => RbcMode::Bracha,
-                }
-            },
-
             // Standard Init
             last_ordered_round: 0,
             finalized_block_count: 0,
             pending_vertices: HashMap::new(),
             already_ordered: HashSet::new(),
             total_bytes_created: 0,
-            echo_counts: HashMap::new(),
-            ready_counts: HashMap::new(),
-            delivered_vertices: HashSet::new(),
-            pending_rbc_vertices: HashMap::new(),
-
-            // Signed-Vote RBC init
-            rbc_votes: HashMap::new(),
-            rbc_vertex_store: HashMap::new(),
-            rbc_commit_sent: HashSet::new(),
 
             vertex_timestamps: HashMap::new(),
             total_commit_latency_us: 0,
@@ -186,7 +162,7 @@ impl Sailfish {
                             }), dispatcher_tx).await;
                         }
                     } else {
-                        // Ok / Byz2: broadcast normally (byz2 attack fires later in try_send_ready).
+                        // Ok / Byz2: broadcast normally (byz2 attack fires later, inside BrachaRbc::try_send_ready).
                         let vertex_message = SparseMessage::Vertex(VertexMessage {
                             sender: my_id,
                             vertex: new_vertex.clone(),
@@ -196,7 +172,9 @@ impl Sailfish {
                         }
                     }
 
-                    self.handle_rbc_val(my_id, new_vertex.clone(), dispatcher_tx).await;
+                    if let Some(vertex) = self.rbc.on_val(my_id, new_vertex.clone(), &TupleDispatcher(dispatcher_tx)).await {
+                        self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }).await;
+                    }
                 }
             }
 
@@ -618,14 +596,17 @@ impl Sailfish {
                        // Clone if needed
                     }));
                     
-                    match msg {
-                        SparseMessage::Vertex(v)     => self.handle_rbc_val(sender, v.vertex, &dispatcher_tx).await,
-                        SparseMessage::RBCEcho(e)    => self.handle_rbc_echo(sender, e.vertex_hash, &dispatcher_tx).await,
-                        SparseMessage::RBCReady(r)   => self.handle_rbc_ready(sender, r, &dispatcher_tx).await,
-                        SparseMessage::RBCVote(v)    => self.handle_rbc_vote(v, &dispatcher_tx).await,
-                        SparseMessage::RBCCommit(c)  => self.handle_rbc_commit(c, &dispatcher_tx).await,
-                        SparseMessage::Timeout(t)    => self.handle_timeout_vote(sender, t.round, t.signature).await,
-                        SparseMessage::Commit(_)     => {}
+                    let delivered = match msg {
+                        SparseMessage::Vertex(v)    => self.rbc.on_val(sender, v.vertex, &TupleDispatcher(&dispatcher_tx)).await,
+                        SparseMessage::RBCEcho(e)   => self.rbc.on_echo(sender, e.vertex_hash, &TupleDispatcher(&dispatcher_tx)).await,
+                        SparseMessage::RBCReady(r)  => self.rbc.on_ready(sender, r, &TupleDispatcher(&dispatcher_tx)).await,
+                        SparseMessage::RBCVote(v)   => self.rbc.on_vote(v, &TupleDispatcher(&dispatcher_tx)).await,
+                        SparseMessage::RBCCommit(c) => self.rbc.on_commit(c, &TupleDispatcher(&dispatcher_tx)).await,
+                        SparseMessage::Timeout(t)   => { self.handle_timeout_vote(sender, t.round, t.signature).await; None }
+                        SparseMessage::Commit(_)    => None,
+                    };
+                    if let Some(vertex) = delivered {
+                        self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }).await;
                     }
                 },
                 Ok(None) => break,
@@ -654,294 +635,6 @@ impl Sailfish {
          }
     }
     
-    async fn handle_rbc_val(&mut self, sender: NodeId, vertex: Vertex, dispatcher_tx: &Sender<SailDispatch>) {
-        match self.rbc_mode {
-            RbcMode::Bracha    => self.handle_rbc_val_bracha(sender, vertex, dispatcher_tx).await,
-            RbcMode::SignedVote => self.handle_rbc_val_sv(vertex, dispatcher_tx).await,
-        }
-    }
-
-    // ── Bracha RBC ────────────────────────────────────────────────────────────
-
-    async fn handle_rbc_val_bracha(&mut self, _sender: NodeId, vertex: Vertex, dispatcher_tx: &Sender<SailDispatch>) {
-        let hash = vertex.hash.clone();
-
-        if self.delivered_vertices.contains(&hash) {
-            return;
-        }
-
-        // Store body if not already present (may have arrived via ECHO before VAL)
-        if !self.pending_rbc_vertices.contains_key(&hash) {
-            self.pending_rbc_vertices.insert(hash.clone(), vertex.clone());
-        }
-
-        // Send ECHO only once per hash
-        let my_id = self.environment.my_node.id;
-        if !self.echo_counts.entry(hash.clone()).or_default().contains(&my_id) {
-            self.echo_counts.get_mut(&hash).unwrap().insert(my_id);
-            let echo_msg = SparseMessage::RBCEcho(crate::network::message::EchoMessage {
-                vertex_hash: hash.clone(),
-            });
-            self.broadcast(echo_msg, dispatcher_tx).await;
-
-            let ready_count = self.ready_counts.get(&hash).map(|s| s.len()).unwrap_or(0);
-            let delivery_threshold = 2 * self.f + 1;
-
-            if ready_count >= delivery_threshold {
-                debug!("[Node {}] RBC LATE DELIVERY: Body arrived after consensus for round {}",
-                    self.environment.my_node.id, vertex.round);
-
-                self.delivered_vertices.insert(hash.clone());
-                self.echo_counts.remove(&hash);
-                self.ready_counts.remove(&hash);
-                self.pending_rbc_vertices.remove(&hash);
-
-                self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }).await;
-            }
-        }
-    }
-
-    // ── Signed-Vote RBC ───────────────────────────────────────────────────────
-
-    /// Leader sends Propose (a plain Vertex message reused). Upon receipt:
-    /// store the body, sign the hash, broadcast a Vote to all.
-    async fn handle_rbc_val_sv(&mut self, vertex: Vertex, dispatcher_tx: &Sender<SailDispatch>) {
-        let hash = vertex.hash.clone();
-
-        if self.delivered_vertices.contains(&hash) {
-            return;
-        }
-
-        // Store vertex body (first copy wins — Propose or any Vote delivers it)
-        self.rbc_vertex_store.entry(hash.clone()).or_insert_with(|| vertex.clone());
-
-        // Sign and broadcast Vote carrying the full body
-        let my_id = self.environment.my_node.id;
-        let signature = self.private_key.sign(&hash).to_bytes().to_vec();
-
-        let vote_msg = SparseMessage::RBCVote(RBCVoteMessage {
-            vertex: vertex.clone(),
-            voter: my_id,
-            signature: signature.clone(),
-        });
-        self.broadcast(vote_msg, dispatcher_tx).await;
-
-        // Count own vote
-        self.rbc_votes.entry(hash.clone()).or_default().insert(my_id, signature);
-        self.check_sv_threshold(hash, dispatcher_tx).await;
-    }
-
-    /// Called for every incoming Vote (including those forwarded by others).
-    async fn handle_rbc_vote(&mut self, msg: RBCVoteMessage, dispatcher_tx: &Sender<SailDispatch>) {
-        let hash = msg.vertex.hash.clone();
-
-        if self.delivered_vertices.contains(&hash) {
-            return;
-        }
-
-        // Verify signature: voter signs the vertex hash with their key
-        if let Some(pk) = self.public_keys.get(&msg.voter) {
-            match Signature::from_bytes(&msg.signature) {
-                Ok(sig) => {
-                    if pk.verify(&hash, &sig).is_err() {
-                        warn!("[Node {}] SV: invalid vote signature from node {}",
-                            self.environment.my_node.id, msg.voter);
-                        return;
-                    }
-                }
-                Err(_) => {
-                    warn!("[Node {}] SV: malformed signature from node {}", self.environment.my_node.id, msg.voter);
-                    return;
-                }
-            }
-        } else {
-            warn!("[Node {}] SV: unknown voter {}", self.environment.my_node.id, msg.voter);
-            return;
-        }
-
-        // Store body if we don't have it yet (handles Byzantine leader that skips Propose)
-        self.rbc_vertex_store.entry(hash.clone()).or_insert_with(|| msg.vertex.clone());
-
-        // Accumulate vote
-        self.rbc_votes.entry(hash.clone()).or_default().insert(msg.voter, msg.signature);
-
-        self.check_sv_threshold(hash, dispatcher_tx).await;
-    }
-
-    /// Once n-f votes are collected, deliver and broadcast a Commit certificate.
-    async fn check_sv_threshold(&mut self, hash: VertexHash, dispatcher_tx: &Sender<SailDispatch>) {
-        let threshold = 2 * self.f + 1; // n - f = 2f+1 with n = 3f+1
-
-        let vote_count = self.rbc_votes.get(&hash).map(|m| m.len()).unwrap_or(0);
-        if vote_count < threshold {
-            return;
-        }
-        if self.delivered_vertices.contains(&hash) {
-            return;
-        }
-
-        // Deliver
-        if let Some(vertex) = self.rbc_vertex_store.get(&hash).cloned() {
-            // Broadcast Commit certificate BEFORE sv_deliver, because sv_deliver
-            // cleans up rbc_votes and rbc_vertex_store for this hash.
-            if !self.rbc_commit_sent.contains(&hash) {
-                self.rbc_commit_sent.insert(hash.clone());
-                let votes = self.rbc_votes.get(&hash).cloned().unwrap_or_default();
-                let commit_msg = SparseMessage::RBCCommit(RBCCommitMessage { vertex: vertex.clone(), votes });
-                self.broadcast(commit_msg, dispatcher_tx).await;
-            }
-
-            self.sv_deliver(vertex, dispatcher_tx).await;
-        } else {
-            // Body not yet received — will deliver once a Vote carrying the body arrives
-            debug!("[Node {}] SV: threshold reached but body not yet available for hash {:?}",
-                self.environment.my_node.id, &hash[..4.min(hash.len())]);
-        }
-    }
-
-    /// Handle an incoming Commit certificate: verify n-f sigs, then deliver.
-    async fn handle_rbc_commit(&mut self, msg: RBCCommitMessage, dispatcher_tx: &Sender<SailDispatch>) {
-        let hash = msg.vertex.hash.clone();
-
-        if self.delivered_vertices.contains(&hash) {
-            return;
-        }
-
-        // Verify the certificate carries at least n-f valid signatures
-        let threshold = 2 * self.f + 1;
-        if msg.votes.len() < threshold {
-            warn!("[Node {}] SV: Commit certificate for {:?} has only {} votes (need {})",
-                self.environment.my_node.id, &hash[..4.min(hash.len())], msg.votes.len(), threshold);
-            return;
-        }
-
-        let mut valid = 0usize;
-        for (voter, sig_bytes) in &msg.votes {
-            if let Some(pk) = self.public_keys.get(voter) {
-                if let Ok(sig) = Signature::from_bytes(sig_bytes) {
-                    if pk.verify(&hash, &sig).is_ok() {
-                        valid += 1;
-                    }
-                }
-            }
-        }
-        if valid < threshold {
-            warn!("[Node {}] SV: Commit certificate only had {}/{} valid sigs",
-                self.environment.my_node.id, valid, threshold);
-            return;
-        }
-
-        // Store body and deliver
-        self.rbc_vertex_store.entry(hash.clone()).or_insert_with(|| msg.vertex.clone());
-        self.sv_deliver(msg.vertex, dispatcher_tx).await;
-    }
-
-    /// Final delivery step shared by Vote-path and Commit-path.
-    async fn sv_deliver(&mut self, vertex: Vertex, _dispatcher_tx: &Sender<SailDispatch>) {
-        let hash = vertex.hash.clone();
-
-        if self.delivered_vertices.contains(&hash) {
-            return;
-        }
-        self.delivered_vertices.insert(hash.clone());
-
-        // Clean up SV state for this hash
-        self.rbc_votes.remove(&hash);
-        self.rbc_vertex_store.remove(&hash);
-
-        debug!("[Node {}] SV: delivered vertex from {} round {}",
-            self.environment.my_node.id, vertex.source, vertex.round);
-
-        self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }).await;
-    }
-    
-    async fn handle_rbc_echo(&mut self, sender: NodeId, hash: VertexHash, dispatcher_tx: &Sender<SailDispatch>) {
-        if self.delivered_vertices.contains(&hash) {
-            return;
-        }
-
-        let votes = self.echo_counts.entry(hash.clone()).or_default();
-        votes.insert(sender);
-
-        let threshold = 2 * self.f + 1;
-
-        if votes.len() >= threshold {
-            self.try_send_ready(hash, dispatcher_tx).await;
-        }
-    }
-
-    async fn handle_rbc_ready(&mut self, sender: NodeId, ready: crate::network::message::ReadyMessage, dispatcher_tx: &Sender<SailDispatch>) {
-        let hash = ready.vertex_hash.clone();
-
-        // Store body from READY if we missed the VAL (fault tolerance)
-        if let Some(vertex) = ready.vertex {
-            if vertex.hash == hash {
-                if !self.pending_rbc_vertices.contains_key(&hash) {
-                    self.pending_rbc_vertices.insert(hash.clone(), vertex);
-                }
-            } else {
-                warn!("[Node {}] BYZ2 DETECTED: READY from Node {} has body hash {:?} but claimed {:?}",
-                    self.environment.my_node.id, sender,
-                    &vertex.hash[..4.min(vertex.hash.len())],
-                    &hash[..4.min(hash.len())]);
-            }
-        }
-
-        let votes = self.ready_counts.entry(hash.clone()).or_default();
-        votes.insert(sender);
-
-        let ready_count = votes.len();
-
-        if ready_count >= self.f + 1 {
-            self.try_send_ready(hash.clone(), dispatcher_tx).await;
-        }
-
-        let delivery_threshold = 2 * self.f + 1;
-        if ready_count >= delivery_threshold && !self.delivered_vertices.contains(&hash) {
-            if let Some(vertex) = self.pending_rbc_vertices.remove(&hash) {
-                debug!("[Node {}] RBC DELIVERED vertex from Node {} in round {}", self.environment.my_node.id, vertex.source, vertex.round);
-
-                self.echo_counts.remove(&hash);
-                self.ready_counts.remove(&hash);
-                self.delivered_vertices.insert(hash);
-
-                self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }).await;
-            } else {
-                warn!("[Node {}] RBC ready to deliver but missing vertex body for hash {:?}", self.environment.my_node.id, hash);
-            }
-        }
-    }
-
-    async fn try_send_ready(&mut self, hash: VertexHash, dispatcher_tx: &Sender<SailDispatch>) {
-        let my_id = self.environment.my_node.id;
-        let votes = self.ready_counts.entry(hash.clone()).or_default();
-
-        if !votes.contains(&my_id) {
-            votes.insert(my_id);
-            let body = if self.environment.my_node.behavior == NodeBehavior::Byz2 {
-                // Byz2: include a fake body that won't match the hash — receivers detect this.
-                self.pending_rbc_vertices.get(&hash).map(|real| {
-                    let mut fake = real.clone();
-                    fake.block = b"byz2_fake_payload".to_vec();
-                    warn!("[Node {}] BYZ2: sending fake body in READY for hash {:?}", my_id, &hash[..4.min(hash.len())]);
-                    fake
-                })
-            } else {
-                self.pending_rbc_vertices.get(&hash).cloned()
-            };
-            let ready_msg = SparseMessage::RBCReady(crate::network::message::ReadyMessage {
-                vertex_hash: hash,
-                vertex: body,
-            });
-            self.broadcast(ready_msg, dispatcher_tx).await;
-        }
-    }
-
-    async fn broadcast(&self, msg: SparseMessage, dispatcher_tx: &Sender<SailDispatch>){
-        if let Err(_) = dispatcher_tx.send((None, msg)).await{
-           error!("[Node {}] Failed to broadcast message: channel closed", self.environment.my_node.id);
-        }
-    }
 
     async fn unicast(&self, target: NodeId, msg: SparseMessage, dispatcher_tx: &Sender<SailDispatch>){
         if let Err(_) = dispatcher_tx.send((Some(target), msg)).await{
@@ -1188,10 +881,7 @@ impl Sailfish {
             format!("{} tx/s", input_rate)
         };
 
-        let rbc_label = match self.rbc_mode {
-            RbcMode::Bracha     => "Bracha",
-            RbcMode::SignedVote => "Signed-Vote",
-        };
+        let rbc_label = self.rbc.name();
 
         println!("\n+ CONFIG:");
         println!("  Protocol:             Sailfish ({} RBC)", rbc_label);
