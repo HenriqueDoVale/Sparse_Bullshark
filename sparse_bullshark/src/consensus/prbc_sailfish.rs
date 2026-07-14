@@ -348,10 +348,45 @@ impl PRBCSailfish {
 
     // ── Vertex creation ────────────────────────────────────────────────────────
 
+    /// BFS from the hash-committed strong edges of round r-1 through all
+    /// known_edges and weak_edges. Returns hashes that are hash-committed at
+    /// rounds < r-1 but are not reachable through that traversal.
+    fn compute_weak_edges_prbc(&self, round: u64, strong_edges: &[VertexHash]) -> Vec<VertexHash> {
+        use std::collections::VecDeque;
+        let mut reachable: HashSet<VertexHash> = HashSet::new();
+        let mut queue: VecDeque<VertexHash> = VecDeque::new();
+
+        for h in strong_edges {
+            if reachable.insert(h.clone()) {
+                queue.push_back(h.clone());
+            }
+        }
+
+        while let Some(h) = queue.pop_front() {
+            let strong = self.known_edges.get(&h).cloned().unwrap_or_default();
+            let weak   = self.dag.vertices.get(&h)
+                .map(|v| v.weak_edges.clone())
+                .unwrap_or_default();
+            for ph in strong.into_iter().chain(weak.into_iter()) {
+                if reachable.insert(ph.clone()) {
+                    queue.push_back(ph.clone());
+                }
+            }
+        }
+
+        // Any hash-committed hash at round < r-1 not reachable through the chain.
+        let mut weak: Vec<VertexHash> = self.hash_committed.iter()
+            .filter(|((r, _), h)| *r + 1 < round && *r > 0 && !reachable.contains(*h))
+            .map(|(_, h)| h.clone())
+            .collect();
+        weak.sort();
+        weak
+    }
+
     fn create_new_vertex(&mut self, round: u64, block: Vec<u8>) -> Vertex {
         let prev_round = round - 1;
 
-        // Edges = all hash-committed hashes from prev_round. O(n_per_round) via index.
+        // Strong edges = all hash-committed hashes from prev_round.
         let edges: Vec<VertexHash> = self
             .hash_committed_by_round
             .get(&prev_round)
@@ -360,6 +395,9 @@ impl PRBCSailfish {
                     .filter_map(|&src| self.hash_committed.get(&(prev_round, src)).cloned())
                     .collect()
             });
+
+        // Weak edges: hash-committed hashes at rounds < r-1 not reachable through strong chain.
+        let weak_edges = if round > 1 { self.compute_weak_edges_prbc(round, &edges) } else { vec![] };
 
         // Sailfish rule: include TC if leader is not hash-committed.
         let tc = if !self.has_leader_hash_committed(prev_round) {
@@ -374,6 +412,7 @@ impl PRBCSailfish {
             source: self.environment.my_node.id,
             block,
             edges,
+            weak_edges,
             signed_round: vec![],
             sample_proof: vec![],
             tc,
@@ -425,8 +464,9 @@ impl PRBCSailfish {
                 hash: hash.clone(),
                 round,
                 source,
-                block: vec![],   // payload pending
-                edges: vec![],   // edges unknown until payload arrives
+                block: vec![],       // payload pending
+                edges: vec![],       // edges unknown until payload arrives
+                weak_edges: vec![],  // filled in by on_execution_ready
                 signed_round: vec![],
                 sample_proof: vec![],
                 tc: None,
@@ -462,12 +502,11 @@ impl PRBCSailfish {
         }
         self.execution_ready.insert(hash.clone());
 
-        // Fill the skeleton in DAG with real block and edges.
-        // PRBC only accesses dag.vertices (never dag.rounds), so we skip
-        // the O(n) linear scan over dag.rounds that Sailfish uses.
+        // Fill the skeleton in DAG with real block, edges, and weak_edges.
         if let Some(entry) = self.dag.vertices.get_mut(&hash) {
             entry.block = vertex.block.clone();
             entry.edges = vertex.edges.clone();
+            entry.weak_edges = vertex.weak_edges.clone();
         }
 
         // Record edges for commit counting and causal traversal.
@@ -576,10 +615,11 @@ impl PRBCSailfish {
                 self.execution_queue.push_back(v.hash.clone());
             }
 
-            // Traverse parents via known_edges (real edges, not skeleton).
+            // Traverse strong parents (via known_edges) and weak parents (v.weak_edges).
             if v.round > 0 {
-                let edges = self.known_edges.get(&v.hash).cloned().unwrap_or_default();
-                for parent_hash in edges {
+                let strong = self.known_edges.get(&v.hash).cloned().unwrap_or_default();
+                let weak   = v.weak_edges.clone();
+                for parent_hash in strong.into_iter().chain(weak.into_iter()) {
                     if !self.already_ordered.contains(&parent_hash) {
                         if let Some(parent) = self.dag.vertices.get(&parent_hash).cloned() {
                             stack.push(parent);
@@ -1020,6 +1060,7 @@ impl PRBCSailfish {
             source: 0,
             block: vec![],
             edges: vec![],
+            weak_edges: vec![],
             signed_round: vec![],
             sample_proof: vec![],
             tc: None,

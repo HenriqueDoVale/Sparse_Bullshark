@@ -325,19 +325,52 @@ impl Sailfish {
         }
     }
 
+    /// BFS from the strong-edge parents through all edges (strong + weak).
+    /// Returns hashes of any DAG vertex at round < r-1 that is not reachable
+    /// through that traversal — these become the weak edges of the new vertex.
+    fn compute_weak_edges(&self, round: u64, strong_edges: &[VertexHash]) -> Vec<VertexHash> {
+        use std::collections::VecDeque;
+        let mut reachable: HashSet<VertexHash> = HashSet::new();
+        let mut queue: VecDeque<VertexHash> = VecDeque::new();
+
+        for h in strong_edges {
+            if reachable.insert(h.clone()) {
+                queue.push_back(h.clone());
+            }
+        }
+
+        while let Some(h) = queue.pop_front() {
+            if let Some(v) = self.dag.vertices.get(&h) {
+                for ph in v.edges.iter().chain(v.weak_edges.iter()) {
+                    if reachable.insert(ph.clone()) {
+                        queue.push_back(ph.clone());
+                    }
+                }
+            }
+        }
+
+        // Any vertex in the DAG at a round strictly older than r-1 that wasn't reached.
+        let mut weak: Vec<VertexHash> = self.dag.vertices.values()
+            .filter(|v| v.round > 0 && v.round + 1 < round && !reachable.contains(&v.hash))
+            .map(|v| v.hash.clone())
+            .collect();
+        weak.sort(); // deterministic order (must match calculate_hash sort)
+        weak
+    }
+
     fn create_new_vertex(&mut self, round: u64, block: Vec<u8>) -> Vertex {
         let prev_round = round - 1;
         let candidates = self.dag.get_round(prev_round).cloned().unwrap_or_default();
-        
-        // Link to parents (Dense style - link to all visible)
+
+        // Strong edges: all round-(r-1) vertices in the local DAG.
         let edges: Vec<VertexHash> = candidates.iter().map(|v| v.hash.clone()).collect();
 
-        // SAILFISH RULE:
-        // "We require a round r vertex to either have a strong path to the round r-1 leader vertex OR include TC"
+        // Weak edges: vertices at rounds < r-1 not reachable through the strong chain.
+        let weak_edges = if round > 1 { self.compute_weak_edges(round, &edges) } else { vec![] };
+
+        // SAILFISH RULE: include TC when the previous-round leader is absent.
         let tc = if !self.has_leader_vertex(prev_round) {
-            // This unwrap is safe because may_advance_round only lets us here if we have Leader OR TC.
-            // If we don't have leader, we MUST have TC.
-            self.current_round_tc.clone() 
+            self.current_round_tc.clone()
         } else {
             None
         };
@@ -348,10 +381,11 @@ impl Sailfish {
             source: self.environment.my_node.id,
             block,
             edges,
+            weak_edges,
             signed_round: vec![],
             sample_proof: vec![],
             tc,
-            nvc: None, 
+            nvc: None,
         };
         v.hash = v.calculate_hash();
         
@@ -408,6 +442,14 @@ impl Sailfish {
                 warn!("[Node {}] ❌ REJECTED from {}: Skipped Leader {} without TC!", 
                     self.environment.my_node.id, source, leader_id);
                 return false;
+            }
+        }
+
+        // 4. WEAK EDGE VALIDATION: each must be in the DAG at a round strictly < r-1.
+        for weak_hash in &v.weak_edges {
+            match self.dag.vertices.get(weak_hash) {
+                Some(wv) if wv.round < prev_round => {}
+                _ => return false,
             }
         }
 
@@ -494,15 +536,12 @@ impl Sailfish {
                 self.committed_vertex_count += 1;
             }
 
-            // Add parents to stack (Traverse backwards)
-            if v.round > 0 { // Don't go below genesis
-                if let Some(parents) = self.dag.get_round(v.round - 1) {
-                    for parent_hash in &v.edges {
-                        // Find the parent vertex struct by its hash
-                        if let Some(parent) = parents.iter().find(|p| p.hash == *parent_hash) {
-                            if !self.already_ordered.contains(&parent.hash) {
-                                stack.push(parent.clone());
-                            }
+            // Traverse both strong edges (round r-1) and weak edges (rounds < r-1).
+            if v.round > 0 {
+                for parent_hash in v.edges.iter().chain(v.weak_edges.iter()) {
+                    if !self.already_ordered.contains(parent_hash) {
+                        if let Some(parent) = self.dag.vertices.get(parent_hash) {
+                            stack.push(parent.clone());
                         }
                     }
                 }
@@ -917,6 +956,7 @@ impl Sailfish {
             source: 0,
             block: vec![],
             edges: vec![],
+            weak_edges: vec![],
             signed_round: vec![],
             sample_proof: vec![],
             tc: None,

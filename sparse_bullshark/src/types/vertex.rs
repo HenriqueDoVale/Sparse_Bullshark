@@ -10,6 +10,10 @@ pub struct Vertex{
     pub source : NodeId,
     pub block : Vec<u8>,
     pub edges : Vec<VertexHash>,
+    /// Weak edges: hashes of vertices at rounds < r-1 that are in the local DAG
+    /// but not reachable through the strong-edge (round r-1) causal chain.
+    /// Ensures orphaned vertices are eventually included in a commit's causal history.
+    pub weak_edges: Vec<VertexHash>,
     pub signed_round : Vec<u8>,
     pub sample_proof: Vec<u8>,
     pub tc: Option<TimeoutCertificate>,
@@ -24,12 +28,19 @@ impl Vertex {
         for edge in &self.edges {
             hasher.update(edge);
         }
+        // Weak edges are sorted before hashing so the hash is deterministic
+        // regardless of the order they were discovered during the BFS.
+        let mut sorted_weak = self.weak_edges.clone();
+        sorted_weak.sort();
+        for edge in &sorted_weak {
+            hasher.update(edge);
+        }
         hasher.update(&self.signed_round);
         hasher.update(&self.sample_proof);
         if let Ok(tc_bytes) = bincode::serialize(&self.tc) {
             hasher.update(&tc_bytes);
         }
-        
+
         if let Ok(nvc_bytes) = bincode::serialize(&self.nvc) {
             hasher.update(&nvc_bytes);
         }
