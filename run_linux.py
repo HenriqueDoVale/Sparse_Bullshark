@@ -155,7 +155,7 @@ def print_summary(config, results, n_nodes):
 
 # ── Node runner ───────────────────────────────────────────────────────────────
 
-async def run_node(node_id, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, timeout_ms, private_key,
+async def run_node(node_id, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, reduced_quorum, timeout_ms, private_key,
                    stdout_buf, stderr_buf, procs):
     env = os.environ.copy()
     env[f"PRIVATE_KEY_{node_id}"] = private_key
@@ -167,6 +167,8 @@ async def run_node(node_id, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, 
         env["RBC_MODE"] = rbc
     if mode == "prbc_sailfish" and no_prbc_sigs:
         env["PRBC_SIGS"] = "off"
+    if mode == "prbc_sailfish" and reduced_quorum:
+        env["REDUCED_QUORUM"] = "on"
     env["ROUND_TIMEOUT_MS"] = str(timeout_ms)
 
     proc = await asyncio.create_subprocess_exec(
@@ -214,6 +216,8 @@ async def main():
                         help="RBC variant for Sailfish (bracha or signed_vote; ignored for prbc_sailfish)")
     parser.add_argument("--no-prbc-sigs", action="store_true",
                         help="Disable Ed25519 vote signatures in PRBC-Sailfish (ignored for sailfish)")
+    parser.add_argument("--reduced-quorum", action="store_true",
+                        help="Use f+1 quorum instead of 2f+1 in PRBC-Sailfish (CFT threshold, not BFT-safe)")
     parser.add_argument("--timeout", type=int, default=500,
                         help="Round timeout in ms for both protocols (default: 500)")
     parser.add_argument("--logs", action="store_true",
@@ -264,7 +268,7 @@ async def main():
         asyncio.create_task(
             run_node(
                 n["id"], args.tx_size, args.n_tx, args.mode,
-                args.input_rate, args.rbc, args.no_prbc_sigs, args.timeout, priv_keys[n["id"]],
+                args.input_rate, args.rbc, args.no_prbc_sigs, args.reduced_quorum, args.timeout, priv_keys[n["id"]],
                 stdout_bufs[i], stderr_bufs[i], procs
             )
         )

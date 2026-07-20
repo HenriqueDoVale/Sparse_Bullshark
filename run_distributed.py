@@ -61,7 +61,7 @@ def group_by_host(nodes):
 
 # ── Remote script builder ──────────────────────────────────────────────────────
 
-def build_remote_script(node_ids, priv_keys, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs):
+def build_remote_script(node_ids, priv_keys, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, reduced_quorum):
     """Build a bash script that runs all assigned nodes on one machine."""
     lines = [
         "#!/bin/bash",
@@ -75,6 +75,8 @@ def build_remote_script(node_ids, priv_keys, tx_size, n_tx, mode, input_rate, rb
         lines.append(f"export RBC_MODE={rbc}")
     if mode == "prbc_sailfish" and no_prbc_sigs:
         lines.append("export PRBC_SIGS=off")
+    if mode == "prbc_sailfish" and reduced_quorum:
+        lines.append("export REDUCED_QUORUM=on")
 
     for nid in node_ids:
         # Single-quote the key: base64 chars never contain single quotes
@@ -205,6 +207,8 @@ async def main():
     parser.add_argument("--rbc",          choices=["bracha", "signed_vote"], default="bracha",
                         help="RBC variant for sailfish mode")
     parser.add_argument("--no-prbc-sigs", action="store_true")
+    parser.add_argument("--reduced-quorum", action="store_true",
+                        help="Use f+1 quorum instead of 2f+1 (CFT threshold, not BFT-safe)")
     parser.add_argument("--logs",         action="store_true", help="Print stderr from each machine")
     args = parser.parse_args()
 
@@ -240,7 +244,7 @@ async def main():
     for ip, node_ids in groups.items():
         script = build_remote_script(
             node_ids, priv_keys, args.tx_size, args.n_tx,
-            args.mode, args.input_rate, args.rbc, args.no_prbc_sigs,
+            args.mode, args.input_rate, args.rbc, args.no_prbc_sigs, args.reduced_quorum,
         )
         machine_order.append((ip, node_ids))
         tasks.append(asyncio.create_task(run_on_machine(ip, script, timeout_secs)))

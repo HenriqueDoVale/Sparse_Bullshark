@@ -106,6 +106,9 @@ pub struct PRBCSailfish {
     // Whether to sign and verify PRBC vote messages (enabled via PRBC_SIGS=on)
     sign_votes: bool,
 
+    // Whether to use f+1 quorum instead of 2f+1 (enabled via REDUCED_QUORUM=on)
+    reduced_quorum: bool,
+
     // Configurable timeouts (ms), read from env vars ROUND_TIMEOUT_MS / RECOVERY_TIMEOUT_MS
     round_timeout_ms: u128,
     recovery_timeout_ms: u128,
@@ -159,6 +162,7 @@ impl PRBCSailfish {
             race_condition_count: 0,
 
             sign_votes: std::env::var("PRBC_SIGS").as_deref() != Ok("off"),
+            reduced_quorum: std::env::var("REDUCED_QUORUM").as_deref() == Ok("on"),
 
             round_timeout_ms: std::env::var("ROUND_TIMEOUT_MS")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
@@ -167,6 +171,10 @@ impl PRBCSailfish {
         };
         node.add_genesis_block();
         node
+    }
+
+    fn quorum(&self) -> usize {
+        if self.reduced_quorum { self.f + 1 } else { 2 * self.f + 1 }
     }
 
     async fn next_batch(&mut self) -> Vec<u8> {
@@ -249,9 +257,9 @@ impl PRBCSailfish {
         }
 
         let prev_round = self.round - 1;
-        let quorum = 2 * self.f + 1;
+        let quorum = self.quorum();
 
-        // 1. Do we have 2f+1 hash-committed vertices from prev_round? O(1) via index.
+        // 1. Do we have quorum hash-committed vertices from prev_round? O(1) via index.
         let hc_count = self
             .hash_committed_by_round
             .get(&prev_round)
@@ -327,9 +335,9 @@ impl PRBCSailfish {
         if round < self.round.saturating_sub(1) {
             return;
         }
+        let quorum = self.quorum();
         let votes = self.timeout_store.entry(round).or_default();
         votes.insert(sender, signature);
-        let quorum = 2 * self.f + 1;
 
         if votes.len() >= quorum
             && self.current_round_tc.is_none()
@@ -561,7 +569,7 @@ impl PRBCSailfish {
                     }).count()
                 });
 
-            if votes >= 2 * self.f + 1 {
+            if votes >= self.quorum() {
                 if !self.already_ordered.contains(&leader_hash) {
                     if let Some(leader_v) = self.dag.vertices.get(&leader_hash).cloned() {
                         self.commit_causal_history_prbc(leader_v);
@@ -788,9 +796,9 @@ impl PRBCSailfish {
             return;
         }
 
+        let quorum = self.quorum();
         let votes = self.prbc_votes.entry(hash.clone()).or_default();
         votes.insert(voter, sig);
-        let quorum = 2 * self.f + 1;
 
         debug!(
             "[Node {}] vote recorded: round={} source={} voter={} count={}/{}",
@@ -811,7 +819,7 @@ impl PRBCSailfish {
         dispatcher_tx: &Sender<DispatchMsg>,
     ) {
         // Only respond if we have the payload AND enough votes to prove it.
-        let quorum = 2 * self.f + 1;
+        let quorum = self.quorum();
         if let Some(vertex) = self.prbc_payloads.get(&msg.hash).cloned() {
             if let Some(votes) = self.prbc_votes.get(&msg.hash) {
                 if votes.len() >= quorum {
@@ -862,7 +870,7 @@ impl PRBCSailfish {
         }
 
         // Verify vote quorum certificate.
-        let quorum = 2 * self.f + 1;
+        let quorum = self.quorum();
         if msg.votes.len() < quorum {
             warn!(
                 "[Node {}] Recovery resp from {}: insufficient votes ({})",
@@ -1428,8 +1436,9 @@ impl PRBCSailfish {
             (self.total_commit_latency_us as f64 / self.committed_vertex_count as f64) / 1000.0
         } else { 0.0 };
 
+        let quorum_label = if self.reduced_quorum { "f+1" } else { "2f+1" };
         println!("\n+ CONFIG:");
-        println!("  Protocol:             PRBC-Sailfish (vote sigs: {})", sigs_label);
+        println!("  Protocol:             PRBC-Sailfish (vote sigs: {}, quorum: {})", sigs_label, quorum_label);
         println!("  Faults:               {} node(s)", f_actual);
         println!("  Fault tolerance:      {} node(s)", f_tolerance);
         println!("  Committee size:       {} node(s)", n);
