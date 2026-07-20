@@ -15,12 +15,13 @@ set -euo pipefail
 # ── Config ────────────────────────────────────────────────────────────────────
 
 BINARY="./target/release/sparse_bullshark"
-NODES_PER_MACHINE=5
+NODES_PER_MACHINE=5          # ← change this to adjust total nodes (total = machines × this)
 SSH_KEY="$HOME/.ssh/google_compute_engine"
 SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o LogLevel=ERROR"
 USER="henriquecostavale"
 
 # Machine internal IP list (order determines node ID assignment)
+# With NODES_PER_MACHINE=5: 10 machines → 50 nodes total
 MACHINE_IPS=(
     "10.164.0.12"   # node-0  → nodes  0-4
     "10.164.0.6"    # node-1  → nodes  5-9
@@ -28,6 +29,10 @@ MACHINE_IPS=(
     "10.164.0.8"    # node-3  → nodes 15-19
     "10.164.0.9"    # node-4  → nodes 20-24
     "10.164.0.10"   # node-5  → nodes 25-29
+    "10.164.0.13"   # node-6  → nodes 30-34
+    "10.164.0.14"   # node-7  → nodes 35-39
+    "10.164.0.15"   # node-8  → nodes 40-44
+    "10.164.0.16"   # node-9  → nodes 45-49
 )
 
 # ── Build if needed ───────────────────────────────────────────────────────────
@@ -90,4 +95,4 @@ wait
 echo ""
 echo "=== Cluster setup complete: $total_nodes nodes across ${#MACHINE_IPS[@]} machines ==="
 echo ""
-echo "Next: python3 run_distributed.py --tx-size 512 --n-tx 500 --mode prbc_sailfish --input-rate 50000"
+echo "Next: python3 run_distributed.py --tx-size 512 --n-tx 500 --mode prbc_sailfish --input-rate 20000"
