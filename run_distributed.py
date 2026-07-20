@@ -226,7 +226,8 @@ async def main():
     print(" STARTING DISTRIBUTED EXPERIMENT")
     print("--------------------------------------------------")
     rbc_suffix = f" [{args.rbc}]" if args.mode == "sailfish" else ""
-    print(f"  Protocol:   {args.mode.replace('_', '-').upper()}{rbc_suffix}")
+    quorum_suffix = " [quorum: f+1]" if (args.mode == "prbc_sailfish" and args.reduced_quorum) else ""
+    print(f"  Protocol:   {args.mode.replace('_', '-').upper()}{rbc_suffix}{quorum_suffix}")
     print(f"  Tx size:    {args.tx_size} B")
     print(f"  Tx/block:   {args.n_tx}")
     print(f"  Nodes:      {len(nodes)}")
