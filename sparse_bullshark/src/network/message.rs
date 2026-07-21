@@ -52,6 +52,25 @@ pub struct RBCCommitMessage {
     pub votes:  std::collections::BTreeMap<NodeId, Vec<u8>>, // voter → signature
 }
 
+// ── Decoupled-mempool (Narwhal-style) messages ────────────────────────────────
+
+/// Carries the raw bytes of a transaction batch, disseminated OUTSIDE the RBC
+/// critical path. In decoupled mode a vertex only references batches by their
+/// `digest`; the payload travels once via this message instead of being
+/// re-forwarded with every RBC echo/vote/ready.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BatchMessage {
+    pub digest:  VertexHash,
+    pub payload: Vec<u8>,   // bincode(Vec<Transaction>)
+}
+
+/// Pull request for a batch a node is missing (it received a vertex referencing
+/// a digest it does not yet hold). Answered with a unicast `BatchMessage`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BatchRequestMessage {
+    pub digest: VertexHash,
+}
+
 /// Unified network message type for Sparse Bullshark.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SparseMessage {
@@ -62,4 +81,6 @@ pub enum SparseMessage {
     RBCCommit(RBCCommitMessage),   // Signed-Vote RBC
     Timeout(TimeoutMessage),
     Commit(CommitMessage),
+    Batch(BatchMessage),               // Decoupled mempool: batch dissemination
+    BatchRequest(BatchRequestMessage), // Decoupled mempool: pull a missing batch
 }

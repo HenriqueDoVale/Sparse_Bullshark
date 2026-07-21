@@ -1,4 +1,5 @@
 pub mod rbc;
+pub mod mempool;
 pub mod bullshark;
 pub mod sparse_bullshark;
 pub mod dag;

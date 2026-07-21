@@ -155,7 +155,7 @@ def print_summary(config, results, n_nodes):
 
 # ── Node runner ───────────────────────────────────────────────────────────────
 
-async def run_node(node_id, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, reduced_quorum, timeout_ms, private_key,
+async def run_node(node_id, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, reduced_quorum, timeout_ms, mempool, private_key,
                    stdout_buf, stderr_buf, procs):
     env = os.environ.copy()
     env[f"PRIVATE_KEY_{node_id}"] = private_key
@@ -165,6 +165,10 @@ async def run_node(node_id, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, 
         env["INPUT_RATE"] = str(input_rate)
     if mode == "sailfish":
         env["RBC_MODE"] = rbc
+        # Narwhal-style decoupled mempool (Sailfish only): vertices carry batch
+        # digests, payloads travel out-of-band. Unset keeps the inline behavior.
+        if mempool == "decoupled":
+            env["MEMPOOL_MODE"] = "decoupled"
     if mode == "prbc_sailfish" and no_prbc_sigs:
         env["PRBC_SIGS"] = "off"
     if mode == "prbc_sailfish" and reduced_quorum:
@@ -220,6 +224,9 @@ async def main():
                         help="Use f+1 quorum instead of 2f+1 in PRBC-Sailfish (CFT threshold, not BFT-safe)")
     parser.add_argument("--timeout", type=int, default=500,
                         help="Round timeout in ms for both protocols (default: 500)")
+    parser.add_argument("--mempool", choices=["inline", "decoupled"], default="inline",
+                        help="Sailfish mempool: 'inline' (payload in vertex, legacy) or "
+                             "'decoupled' (Narwhal-style, vertex carries batch digests). Ignored for prbc_sailfish.")
     parser.add_argument("--logs", action="store_true",
                         help="Print captured stderr (warn/error logs) from each node after results")
     args = parser.parse_args()
@@ -252,6 +259,8 @@ async def main():
     print("--------------------------------------------------")
     rbc_suffix = f" [{args.rbc}]" if args.mode == "sailfish" else ""
     print(f"  Protocol:   {args.mode.replace('_', '-').upper()}{rbc_suffix}")
+    if args.mode == "sailfish":
+        print(f"  Mempool:    {args.mempool}")
     print(f"  Tx size:    {args.tx_size} B")
     print(f"  Tx/block:   {args.n_tx}")
     print(f"  Nodes:      {len(nodes)}")
@@ -268,7 +277,7 @@ async def main():
         asyncio.create_task(
             run_node(
                 n["id"], args.tx_size, args.n_tx, args.mode,
-                args.input_rate, args.rbc, args.no_prbc_sigs, args.reduced_quorum, args.timeout, priv_keys[n["id"]],
+                args.input_rate, args.rbc, args.no_prbc_sigs, args.reduced_quorum, args.timeout, args.mempool, priv_keys[n["id"]],
                 stdout_bufs[i], stderr_bufs[i], procs
             )
         )

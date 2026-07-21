@@ -11,9 +11,10 @@ use tokio::{
 use shared::{domain::{environment::Environment, node::NodeBehavior}, transaction_generator::TransactionGenerator};
 use crate::{
     consensus::dag::DAG,
+    consensus::mempool::{BatchStore, BatchDigest, batch_digest, encode_digests, decode_digests},
     consensus::rbc::{ReliableBroadcast, TupleDispatcher, bracha::BrachaRbc, signed_vote::SignedVoteRbc},
     network::{broadcast::generate_nonce, message::{
-        SparseMessage, VertexMessage, TimeoutMessage,
+        SparseMessage, VertexMessage, TimeoutMessage, BatchMessage, BatchRequestMessage,
     }},
     types::vertex::{NodeId, Vertex, VertexHash, TimeoutCertificate},
 };
@@ -65,6 +66,16 @@ pub struct Sailfish {
 
     // Configurable round timeout (ms), read from ROUND_TIMEOUT_MS env var
     round_timeout_ms: u128,
+
+    // --- Decoupled mempool (Narwhal-style data plane) ---
+    // When true, vertices carry only batch digests; payloads are disseminated
+    // out-of-band and cached in `batch_store`. Toggled via MEMPOOL_MODE=decoupled.
+    mempool_decoupled: bool,
+    batch_store: BatchStore,
+    // Vertices delivered by RBC but not yet insertable because a referenced
+    // batch is missing locally. Keyed by the missing digest; drained when the
+    // batch arrives.
+    pending_on_batch: HashMap<BatchDigest, Vec<(NodeId, VertexMessage)>>,
 }
 
 impl Sailfish {
@@ -112,6 +123,11 @@ impl Sailfish {
 
             round_timeout_ms: std::env::var("ROUND_TIMEOUT_MS")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
+
+            mempool_decoupled: std::env::var("MEMPOOL_MODE")
+                .map(|v| v.eq_ignore_ascii_case("decoupled")).unwrap_or(false),
+            batch_store: BatchStore::new(),
+            pending_on_batch: HashMap::new(),
         };
         node.add_genesis_block();
         node
@@ -137,7 +153,7 @@ impl Sailfish {
                     self.current_round_tc = None;
                     warn!("[Node {}] SILENT: skipped vertex for round {}", my_id, self.round - 1);
                 } else {
-                    let block = self.next_batch().await;
+                    let block = self.next_batch(dispatcher_tx).await;
                     let new_vertex = self.create_new_vertex(self.round, block);
                     self.vertex_timestamps.entry(new_vertex.hash.clone()).or_insert_with(Instant::now);
                     self.dag.insert(new_vertex.clone());
@@ -173,7 +189,7 @@ impl Sailfish {
                     }
 
                     if let Some(vertex) = self.rbc.on_val(my_id, new_vertex.clone(), &TupleDispatcher(dispatcher_tx)).await {
-                        self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }).await;
+                        self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }, dispatcher_tx).await;
                     }
                 }
             }
@@ -186,11 +202,13 @@ impl Sailfish {
                     for (sender_id, vm) in pending {
                         // Attempt to validate now that we might have parents/TCs
                         if self.validate_vertex(&vm.vertex, vm.vertex.round, sender_id) {
-                            progress = true;
-                            debug!("[Node {}] Un-buffered vertex from Node {} in round {}", self.environment.my_node.id, sender_id, vm.vertex.round);
-                            self.vertex_timestamps.entry(vm.vertex.hash.clone()).or_insert_with(Instant::now);
-                            self.dag.insert(vm.vertex.clone());
-                            self.try_committing_sailfish(); // Check commit rule
+                            // Decoupled mempool: only insert once batches are available;
+                            // otherwise ensure_batches_available buffers + pulls them.
+                            if self.ensure_batches_available(sender_id, &vm, dispatcher_tx).await {
+                                progress = true;
+                                debug!("[Node {}] Un-buffered vertex from Node {} in round {}", self.environment.my_node.id, sender_id, vm.vertex.round);
+                                self.insert_valid_vertex(vm);
+                            }
                         } else {
                             still_pending.push((sender_id, vm));
                         }
@@ -530,14 +548,33 @@ impl Sailfish {
 
     // --- STANDARD BOILERPLATE (Network & RBC) ---
     
-    async fn next_batch(&mut self) -> Vec<u8> {
-        if let Some(rx) = &mut self.batch_receiver {
+    async fn next_batch(&mut self, dispatcher_tx: &Sender<SailDispatch>) -> Vec<u8> {
+        // Pull the next serialized batch payload from the generator task.
+        let payload = if let Some(rx) = &mut self.batch_receiver {
             match rx.try_recv() {
-                Ok(b) => return b,
-                Err(_) => if let Some(b) = rx.recv().await { return b; },
+                Ok(b) => b,
+                Err(_) => rx.recv().await.unwrap_or_default(),
             }
+        } else {
+            Vec::new()
+        };
+
+        if !self.mempool_decoupled {
+            // Inline (legacy): the vertex block IS the payload.
+            return payload;
         }
-        vec![]
+
+        // Decoupled (Narwhal-style): cache the batch locally, disseminate it
+        // once off the RBC critical path, and put only its digest in the vertex.
+        let digest = batch_digest(&payload);
+        if !self.batch_store.contains(&digest) {
+            self.batch_store.insert(digest.clone(), payload.clone());
+        }
+        let _ = dispatcher_tx.send((None, SparseMessage::Batch(BatchMessage {
+            digest: digest.clone(),
+            payload,
+        }))).await;
+        encode_digests(&[digest])
     }
 
     pub async fn start(mut self) {
@@ -604,9 +641,11 @@ impl Sailfish {
                         SparseMessage::RBCCommit(c) => self.rbc.on_commit(c, &TupleDispatcher(&dispatcher_tx)).await,
                         SparseMessage::Timeout(t)   => { self.handle_timeout_vote(sender, t.round, t.signature).await; None }
                         SparseMessage::Commit(_)    => None,
+                        SparseMessage::Batch(b)        => { self.handle_batch(b.digest, b.payload, &dispatcher_tx).await; None }
+                        SparseMessage::BatchRequest(r) => { self.handle_batch_request(sender, r.digest, &dispatcher_tx).await; None }
                     };
                     if let Some(vertex) = delivered {
-                        self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }).await;
+                        self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }, &dispatcher_tx).await;
                     }
                 },
                 Ok(None) => break,
@@ -622,11 +661,14 @@ impl Sailfish {
 
     // --- HELPERS (Copied from Bullshark/SparseBullshark) ---
     
-    async fn handle_new_vertex_message(&mut self, sender: NodeId, vm: VertexMessage) {
+    async fn handle_new_vertex_message(&mut self, sender: NodeId, vm: VertexMessage, dispatcher_tx: &Sender<SailDispatch>) {
          if self.validate_vertex(&vm.vertex, vm.vertex.round, sender) {
-            self.vertex_timestamps.entry(vm.vertex.hash.clone()).or_insert_with(Instant::now);
-            self.dag.insert(vm.vertex.clone());
-            self.try_committing_sailfish();
+            // Decoupled mempool: hold the vertex until every referenced batch is
+            // locally available (Narwhal-style availability before inclusion).
+            if !self.ensure_batches_available(sender, &vm, dispatcher_tx).await {
+                return;
+            }
+            self.insert_valid_vertex(vm);
          } else {
              // Buffer if it's from the future
              if vm.vertex.round >= self.round.saturating_sub(1) {
@@ -634,7 +676,76 @@ impl Sailfish {
              }
          }
     }
-    
+
+    /// Insert a validated, batch-available vertex into the DAG and try to commit.
+    fn insert_valid_vertex(&mut self, vm: VertexMessage) {
+        self.vertex_timestamps.entry(vm.vertex.hash.clone()).or_insert_with(Instant::now);
+        self.dag.insert(vm.vertex.clone());
+        self.try_committing_sailfish();
+    }
+
+    /// Digests a vertex references that are not yet in the local batch store.
+    /// Always empty in inline mode (the payload travels inside the vertex).
+    fn missing_batches(&self, v: &Vertex) -> Vec<BatchDigest> {
+        if !self.mempool_decoupled { return Vec::new(); }
+        decode_digests(&v.block)
+            .into_iter()
+            .filter(|d| !self.batch_store.contains(d))
+            .collect()
+    }
+
+    /// Returns true when all referenced batches are available (caller may
+    /// insert). Otherwise buffers the vertex under each missing digest, pulls
+    /// the batches from the vertex's source, and returns false.
+    async fn ensure_batches_available(&mut self, sender: NodeId, vm: &VertexMessage, dispatcher_tx: &Sender<SailDispatch>) -> bool {
+        let missing = self.missing_batches(&vm.vertex);
+        if missing.is_empty() { return true; }
+        for d in &missing {
+            self.pending_on_batch.entry(d.clone()).or_default().push((sender, vm.clone()));
+        }
+        for d in missing {
+            self.unicast(
+                vm.vertex.source,
+                SparseMessage::BatchRequest(BatchRequestMessage { digest: d }),
+                dispatcher_tx,
+            ).await;
+        }
+        false
+    }
+
+    /// A batch arrived (via dissemination or a pull reply): cache it and retry
+    /// any vertices that were waiting on it.
+    async fn handle_batch(&mut self, digest: BatchDigest, payload: Vec<u8>, dispatcher_tx: &Sender<SailDispatch>) {
+        if !self.batch_store.contains(&digest) {
+            if batch_digest(&payload) != digest { return; } // integrity: digest must match payload
+            self.batch_store.insert(digest.clone(), payload);
+        }
+        if let Some(waiters) = self.pending_on_batch.remove(&digest) {
+            for (sender, vm) in waiters {
+                if self.missing_batches(&vm.vertex).is_empty() {
+                    self.handle_new_vertex_message(sender, vm, dispatcher_tx).await;
+                } else {
+                    // Still missing other digests — re-buffer under those.
+                    for d in self.missing_batches(&vm.vertex) {
+                        self.pending_on_batch.entry(d).or_default().push((sender, vm.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Answer a peer's pull request for a batch we hold.
+    async fn handle_batch_request(&self, requester: NodeId, digest: BatchDigest, dispatcher_tx: &Sender<SailDispatch>) {
+        if let Some(payload) = self.batch_store.get(&digest) {
+            self.unicast(
+                requester,
+                SparseMessage::Batch(BatchMessage { digest, payload: payload.clone() }),
+                dispatcher_tx,
+            ).await;
+        }
+    }
+
+
 
     async fn unicast(&self, target: NodeId, msg: SparseMessage, dispatcher_tx: &Sender<SailDispatch>){
         if let Err(_) = dispatcher_tx.send((Some(target), msg)).await{
@@ -883,8 +994,11 @@ impl Sailfish {
 
         let rbc_label = self.rbc.name();
 
+        let mempool_label = if self.mempool_decoupled { "decoupled (digests)" } else { "inline (payload)" };
+
         println!("\n+ CONFIG:");
         println!("  Protocol:             Sailfish ({} RBC)", rbc_label);
+        println!("  Mempool:              {}", mempool_label);
         println!("  Faults:               {} node(s)", f_actual);
         println!("  Fault tolerance:      {} node(s)", f_tolerance);
         println!("  Committee size:       {} node(s)", n);
@@ -904,5 +1018,8 @@ impl Sailfish {
         println!("  Consensus TPS:        {:.0} tx/s", tps);
         println!("  Consensus BPS:        {:.0} B/s", bps);
         println!("  Consensus latency:    {:.1} ms", avg_latency_ms);
+        if self.mempool_decoupled {
+            println!("  Batches cached:       {}", self.batch_store.len());
+        }
     }
 }
