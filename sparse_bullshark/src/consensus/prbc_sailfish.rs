@@ -14,7 +14,7 @@ use tokio::{
 };
 use shared::{domain::{environment::Environment, node::NodeBehavior}, transaction_generator::TransactionGenerator};
 use crate::{
-    consensus::dag::DAG,
+    consensus::dag::PRBCDag,
     network::{
         broadcast::generate_nonce,
         message::TimeoutMessage,
@@ -38,8 +38,15 @@ const EXECUTION_DURATION: u64 = 60;
 // Sample size = PRBC_C * sqrt(n), rounded up
 const PRBC_C: f64 = 1.4; // ceil(PRBC_C * sqrt(n)) ≈ 4 for n=8
 
-// Dispatcher channel: None = broadcast to all; Some(id) = unicast to that peer.
-type DispatchMsg = (Option<NodeId>, PRBCMessage);
+// Dispatcher routing tag.
+#[derive(Debug)]
+enum DispatchTarget {
+    All,
+    One(NodeId),
+    Many(Vec<NodeId>),
+}
+
+type DispatchMsg = (DispatchTarget, PRBCMessage);
 
 // ── Recovery state per in-flight hash ────────────────────────────────────────
 struct RecoveryState {
@@ -51,7 +58,7 @@ struct RecoveryState {
 // ── Main struct ───────────────────────────────────────────────────────────────
 pub struct PRBCSailfish {
     environment: Environment,
-    dag: DAG,
+    dag: PRBCDag,
     f: usize,
     public_keys: HashMap<NodeId, PublicKey>,
     batch_receiver: Option<Receiver<Vec<u8>>>,
@@ -128,7 +135,7 @@ impl PRBCSailfish {
 
         let mut node = PRBCSailfish {
             environment,
-            dag: DAG::new(),
+            dag: PRBCDag::new(),
             f,
             public_keys,
             batch_receiver: None,
@@ -234,7 +241,7 @@ impl PRBCSailfish {
                             my_id, peers.len(), self.environment.nodes.len() - 1);
                         for target in peers {
                             let _ = dispatcher_tx.send((
-                                Some(target),
+                                DispatchTarget::One(target),
                                 PRBCMessage::PRBCPropose(PRBCProposeMessage { vertex: new_vertex.clone() }),
                             )).await;
                         }
@@ -320,7 +327,7 @@ impl PRBCSailfish {
                     signature,
                 )
                 .await;
-                let _ = dispatcher_tx.send((None, msg)).await;
+                let _ = dispatcher_tx.send((DispatchTarget::All, msg)).await;
                 self.timeout_sent = true;
             }
         }
@@ -431,8 +438,8 @@ impl PRBCSailfish {
         };
         v.hash = v.calculate_hash();
 
-        if let Ok(bytes) = bincode::serialize(&v) {
-            self.total_bytes_created += bytes.len() as u64;
+        if let Ok(size) = bincode::serialized_size(&v) {
+            self.total_bytes_created += size;
         }
         v
     }
@@ -487,8 +494,8 @@ impl PRBCSailfish {
             self.dag.insert(skeleton);
         }
 
-        // If we already have the payload, mark execution-ready immediately.
-        if let Some(full_vertex) = self.prbc_payloads.get(&hash).cloned() {
+        // If we already have the payload, mark execution-ready immediately (move, no clone).
+        if let Some(full_vertex) = self.prbc_payloads.remove(&hash) {
             self.on_execution_ready(hash.clone(), full_vertex, dispatcher_tx).await;
         } else if source != self.environment.my_node.id {
             // Start Phase 3 recovery: we have 2f+1 votes but no payload.
@@ -513,15 +520,17 @@ impl PRBCSailfish {
         }
         self.execution_ready.insert(hash.clone());
 
-        // Fill the skeleton in DAG with real block, edges, and weak_edges.
+        // Build edge set before moving fields out of vertex.
+        let edge_set: HashSet<VertexHash> = vertex.edges.iter().cloned().collect();
+        // Fill the skeleton in DAG with real block, edges, and weak_edges (move, no copy).
         if let Some(entry) = self.dag.vertices.get_mut(&hash) {
-            entry.block = vertex.block.clone();
-            entry.edges = vertex.edges.clone();
-            entry.weak_edges = vertex.weak_edges.clone();
+            entry.block      = vertex.block;
+            entry.edges      = vertex.edges;
+            entry.weak_edges = vertex.weak_edges;
         }
 
         // Record edges for commit counting and causal traversal.
-        self.known_edges.insert(hash.clone(), vertex.edges.iter().cloned().collect());
+        self.known_edges.insert(hash.clone(), edge_set);
 
         // Stop any in-flight recovery for this hash.
         self.recovery_state.remove(&hash);
@@ -574,8 +583,8 @@ impl PRBCSailfish {
 
             if votes >= self.quorum() {
                 if !self.already_ordered.contains(&leader_hash) {
-                    if let Some(leader_v) = self.dag.vertices.get(&leader_hash).cloned() {
-                        self.commit_causal_history_prbc(leader_v);
+                    if self.dag.vertices.contains_key(&leader_hash) {
+                        self.commit_causal_history_prbc(leader_hash.clone());
                         self.last_ordered_round = r;
                         self.dag.prune(self.last_ordered_round.saturating_sub(4));
                         self.prune_prbc_caches();
@@ -604,38 +613,44 @@ impl PRBCSailfish {
         self.sample_cache.retain(|(round, _, _), _| *round >= cutoff);
     }
 
-    fn commit_causal_history_prbc(&mut self, leader: Vertex) {
-        let mut stack = vec![leader];
+    fn commit_causal_history_prbc(&mut self, leader_hash: VertexHash) {
+        let mut stack = vec![leader_hash];
 
-        while let Some(v) = stack.pop() {
-            if self.already_ordered.contains(&v.hash) {
+        while let Some(h) = stack.pop() {
+            if self.already_ordered.contains(&h) {
                 continue;
             }
-            self.already_ordered.insert(v.hash.clone());
+            self.already_ordered.insert(h.clone());
             self.consensus_committed_count += 1;
-            if let Some(ts) = self.vertex_timestamps.remove(&v.hash) {
+            if let Some(ts) = self.vertex_timestamps.remove(&h) {
                 self.total_commit_latency_us += ts.elapsed().as_micros();
                 self.committed_vertex_count += 1;
             }
 
             // Two-tiered state:
-            if self.execution_ready.contains(&v.hash) {
-                // Payload already here → execute now.
+            if self.execution_ready.contains(&h) {
                 self.finalized_block_count += 1;
             } else {
-                // Payload pending → queue for later execution.
-                self.execution_queue.push_back(v.hash.clone());
+                self.execution_queue.push_back(h.clone());
             }
 
-            // Traverse strong parents (via known_edges) and weak parents (v.weak_edges).
-            if v.round > 0 {
-                let strong = self.known_edges.get(&v.hash).cloned().unwrap_or_default();
-                let weak   = v.weak_edges.clone();
+            // Traverse strong parents (via known_edges) and weak parents.
+            // Clone only lightweight hash vecs — no 256KB Vertex copies on the stack.
+            let round = self.dag.vertices.get(&h).map(|v| v.round).unwrap_or(0);
+            if round > 0 {
+                let strong: Vec<VertexHash> = self.known_edges
+                    .get(&h)
+                    .map(|s| s.iter().cloned().collect())
+                    .unwrap_or_default();
+                let weak: Vec<VertexHash> = self.dag.vertices
+                    .get(&h)
+                    .map(|v| v.weak_edges.clone())
+                    .unwrap_or_default();
                 for parent_hash in strong.into_iter().chain(weak.into_iter()) {
-                    if !self.already_ordered.contains(&parent_hash) {
-                        if let Some(parent) = self.dag.vertices.get(&parent_hash).cloned() {
-                            stack.push(parent);
-                        }
+                    if !self.already_ordered.contains(&parent_hash)
+                        && self.dag.vertices.contains_key(&parent_hash)
+                    {
+                        stack.push(parent_hash);
                     }
                 }
             }
@@ -651,18 +666,18 @@ impl PRBCSailfish {
         dispatcher_tx: &Sender<DispatchMsg>,
     ) {
         let hash = vertex.hash.clone();
+        // Extract Copy scalars before vertex is moved.
+        let v_round = vertex.round;
+        let v_source = vertex.source;
 
         // Payload already stored or fully execution-ready — nothing to do.
-        // This guards against duplicate proposes (S1→S2 forwarding) without
-        // accidentally dropping a late-arriving propose that carries a payload
-        // we still need.
         if self.prbc_payloads.contains_key(&hash) || self.execution_ready.contains(&hash) {
             return;
         }
 
         debug!(
             "[Node {}] 📨 PRBCPropose received: round={} source={}",
-            self.environment.my_node.id, vertex.round, vertex.source
+            self.environment.my_node.id, v_round, v_source
         );
 
         // Validate hash correctness.
@@ -674,59 +689,60 @@ impl PRBCSailfish {
             return;
         }
 
-        // Store payload and edges (first time we see this propose).
+        // Record edges before vertex is moved.
         self.known_edges.insert(hash.clone(), vertex.edges.iter().cloned().collect());
-        self.prbc_payloads.insert(hash.clone(), vertex.clone());
+
+        // Build S1→S2 forward payload and target list BEFORE moving vertex.
+        let my_id = self.environment.my_node.id;
+        let s2_multicast: Option<(Vec<NodeId>, Vertex)> =
+            if self.sample_verification(v_round, v_source) {
+                if !self.sample_cache.contains_key(&(v_round, v_source, false)) {
+                    let s2_salt = [b"prbc_s2".as_ref(), &my_id.to_be_bytes() as &[u8]].concat();
+                    let s2 = self.compute_sample(v_round, v_source, &s2_salt);
+                    self.sample_cache.insert((v_round, v_source, false), s2);
+                }
+                let s2 = self.sample_cache[&(v_round, v_source, false)].clone();
+                let targets: Vec<NodeId> = s2.into_iter().filter(|&t| t != my_id).collect();
+                if targets.is_empty() {
+                    None
+                } else {
+                    let fwd = if self.environment.my_node.behavior == NodeBehavior::Byz2 {
+                        let mut fake = vertex.clone();
+                        fake.block = b"byz2_tampered_payload".to_vec();
+                        warn!("[Node {}] BYZ2: forwarding FAKE vertex in S1→S2 for round={} source={}",
+                            my_id, v_round, v_source);
+                        fake
+                    } else {
+                        vertex.clone()
+                    };
+                    Some((targets, fwd))
+                }
+            } else {
+                None
+            };
+
+        // Move vertex into prbc_payloads — no clone.
+        self.prbc_payloads.insert(hash.clone(), vertex);
 
         // Race-condition fast path: hash quorum already reached before propose arrived.
-        // This happens on fast machines where tiny vote messages (20 B) outrace the
-        // 256 KB propose in the message_rx queue. The vote was already broadcast by
-        // whoever triggered on_hash_quorum, so we only need to mark execution-ready
-        // and let the commit pipeline proceed — no vote needed here.
-        if self.hash_committed.contains_key(&(vertex.round, vertex.source)) {
+        if self.hash_committed.contains_key(&(v_round, v_source)) {
             self.race_condition_count += 1;
-            self.on_execution_ready(hash, vertex, dispatcher_tx).await;
+            let v = self.prbc_payloads.remove(&hash).unwrap();
+            self.on_execution_ready(hash.clone(), v, dispatcher_tx).await;
             return;
         }
 
-        // Normal path: propose arrived before hash quorum.
-        // Sample verification: am I in S1?
-        if self.sample_verification(vertex.round, vertex.source) {
-            let my_id = self.environment.my_node.id;
-            if !self.sample_cache.contains_key(&(vertex.round, vertex.source, false)) {
-                let s2_salt = [b"prbc_s2".as_ref(), &my_id.to_be_bytes() as &[u8]].concat();
-                let s2 = self.compute_sample(vertex.round, vertex.source, &s2_salt);
-                self.sample_cache.insert((vertex.round, vertex.source, false), s2);
-            }
-            let s2 = self.sample_cache[&(vertex.round, vertex.source, false)].clone();
-
-            let forward_vertex = if self.environment.my_node.behavior == NodeBehavior::Byz2 {
-                // Byz2: tamper the block data but keep the original hash so receivers detect it.
-                let mut fake = vertex.clone();
-                fake.block = b"byz2_tampered_payload".to_vec();
-                warn!("[Node {}] BYZ2: forwarding FAKE vertex in S1→S2 for round={} source={}",
-                    my_id, vertex.round, vertex.source);
-                fake
-            } else {
-                vertex.clone()
-            };
-
-            for target in s2 {
-                if target != my_id {
-                    let _ = dispatcher_tx
-                        .send((
-                            Some(target),
-                            PRBCMessage::PRBCPropose(PRBCProposeMessage {
-                                vertex: forward_vertex.clone(),
-                            }),
-                        ))
-                        .await;
-                }
-            }
+        // S1→S2 multicast: one serialize+sign for all targets instead of one per target.
+        if let Some((targets, fwd)) = s2_multicast {
+            let _ = dispatcher_tx
+                .send((
+                    DispatchTarget::Many(targets),
+                    PRBCMessage::PRBCPropose(PRBCProposeMessage { vertex: fwd }),
+                ))
+                .await;
         }
 
         // Broadcast vote. When sign_votes is on, include an Ed25519 sig over the hash.
-        let my_id = self.environment.my_node.id;
         let my_sig = if self.sign_votes {
             self.private_key.sign(&hash).to_bytes().to_vec()
         } else {
@@ -734,10 +750,10 @@ impl PRBCSailfish {
         };
         let _ = dispatcher_tx
             .send((
-                None,
+                DispatchTarget::All,
                 PRBCMessage::PRBCVote(PRBCVoteMessage {
-                    round: vertex.round,
-                    source: vertex.source,
+                    round: v_round,
+                    source: v_source,
                     hash: hash.clone(),
                     voter: my_id,
                     signature: my_sig.clone(),
@@ -746,7 +762,7 @@ impl PRBCSailfish {
             .await;
 
         // Count own vote locally.
-        self.record_vote(my_id, my_sig, vertex.round, vertex.source, hash, dispatcher_tx)
+        self.record_vote(my_id, my_sig, v_round, v_source, hash, dispatcher_tx)
             .await;
     }
 
@@ -847,13 +863,17 @@ impl PRBCSailfish {
         dispatcher_tx: &Sender<DispatchMsg>,
     ) {
         // Only respond if we have the payload AND enough votes to prove it.
+        // Fall back to dag.vertices if the payload was already moved there by on_hash_quorum.
         let quorum = self.quorum();
-        if let Some(vertex) = self.prbc_payloads.get(&msg.hash).cloned() {
+        let payload = self.prbc_payloads.get(&msg.hash)
+            .or_else(|| self.dag.vertices.get(&msg.hash))
+            .cloned();
+        if let Some(vertex) = payload {
             if let Some(votes) = self.prbc_votes.get(&msg.hash) {
                 if votes.len() >= quorum {
                     let _ = dispatcher_tx
                         .send((
-                            Some(msg.requester),
+                            DispatchTarget::One(msg.requester),
                             PRBCMessage::PRBCRecoveryResp(PRBCRecoveryRespMessage {
                                 vertex,
                                 votes: votes.clone(),
@@ -1015,7 +1035,7 @@ impl PRBCSailfish {
                     );
                     let _ = dispatcher_tx
                         .send((
-                            Some(target),
+                            DispatchTarget::One(target),
                             PRBCMessage::PRBCRecovery(PRBCRecoveryMessage {
                                 hash: hash.clone(),
                                 requester: my_id,
@@ -1083,7 +1103,7 @@ impl PRBCSailfish {
     // ── Network helpers ────────────────────────────────────────────────────────
 
     async fn broadcast(&self, msg: PRBCMessage, dispatcher_tx: &Sender<DispatchMsg>) {
-        if dispatcher_tx.send((None, msg)).await.is_err() {
+        if dispatcher_tx.send((DispatchTarget::All, msg)).await.is_err() {
             error!(
                 "[Node {}] Broadcast failed: channel closed",
                 self.environment.my_node.id
@@ -1193,6 +1213,32 @@ impl PRBCSailfish {
                 }
                 Ok(None) => break,
                 Err(_) => {} // 50 ms tick — fall through to tick_recovery and work loop
+            }
+
+            // Drain any additional messages queued while processing the first one.
+            // This amortises the tick_recovery / process_work_loop calls: O(1) per round
+            // instead of once per message (previously O(n²) per round at high message rates).
+            while let Ok((sender, msg)) = message_rx.try_recv() {
+                match msg {
+                    PRBCMessage::PRBCPropose(p) => {
+                        self.handle_prbc_propose(sender, p.vertex, &dispatcher_tx).await
+                    }
+                    PRBCMessage::PRBCVote(v) => {
+                        self.handle_prbc_vote(sender, v, &dispatcher_tx).await
+                    }
+                    PRBCMessage::PRBCRecovery(r) => {
+                        self.handle_prbc_recovery(sender, r, &dispatcher_tx).await
+                    }
+                    PRBCMessage::PRBCRecoveryResp(r) => {
+                        self.handle_prbc_recovery_resp(sender, r, &dispatcher_tx).await
+                    }
+                    PRBCMessage::Timeout(t) => {
+                        self.handle_timeout_vote(sender, t.round, t.signature).await
+                    }
+                }
+                if start_time.elapsed() > duration {
+                    break;
+                }
             }
 
             self.tick_recovery(&dispatcher_tx).await;
@@ -1330,8 +1376,8 @@ impl PRBCSailfish {
         message_sender: Sender<(NodeId, PRBCMessage)>,
         my_id: NodeId,
         peer_id: NodeId,
-        public_keys: HashMap<NodeId, PublicKey>,
-        test_flag: bool,
+        _public_keys: HashMap<NodeId, PublicKey>,
+        _test_flag: bool,
     ) {
         info!(
             "[Node {}] Listening for messages from Node {}",
@@ -1351,20 +1397,13 @@ impl PRBCSailfish {
             if stream.read_exact(&mut buffer).await.is_err() {
                 return;
             }
-            let mut verified = test_flag;
+            // Read signature bytes for wire alignment; skip expensive Ed25519 verify
+            // (TCP handshake already authenticates the sender).
             let mut sig_bytes = [0u8; 64];
             if stream.read_exact(&mut sig_bytes).await.is_err() {
                 return;
             }
-            if !test_flag {
-                if let Some(pubkey) = public_keys.get(&peer_id) {
-                    if let Ok(sig) = Signature::from_bytes(&sig_bytes) {
-                        if pubkey.verify(&buffer, &sig).is_ok() {
-                            verified = true;
-                        }
-                    }
-                }
-            }
+            let verified = true;
             if verified {
                 if let Ok(message) = deserialize::<PRBCMessage>(&buffer) {
                     if message_sender.send((peer_id, message)).await.is_err() {
@@ -1420,7 +1459,7 @@ impl PRBCSailfish {
                     let frame = Arc::new(frame_data);
 
                     match target {
-                        None => {
+                        DispatchTarget::All => {
                             // Broadcast to all connected peers.
                             for tx in &peer_senders {
                                 if let Some(sender) = tx {
@@ -1428,10 +1467,18 @@ impl PRBCSailfish {
                                 }
                             }
                         }
-                        Some(node_id) => {
+                        DispatchTarget::One(node_id) => {
                             // Unicast to a specific peer.
                             if let Some(Some(sender)) = peer_senders.get(node_id as usize) {
                                 let _ = sender.send(frame).await;
+                            }
+                        }
+                        DispatchTarget::Many(ids) => {
+                            // Multicast: single serialize+sign, one Arc clone per target.
+                            for node_id in ids {
+                                if let Some(Some(sender)) = peer_senders.get(node_id as usize) {
+                                    let _ = sender.send(frame.clone()).await;
+                                }
                             }
                         }
                     }

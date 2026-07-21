@@ -2,6 +2,40 @@ use crate::types::vertex::{Vertex};
 use std::{collections::{HashMap, HashSet, VecDeque}};
 use crate::types::vertex::{VertexHash};
 
+// ── PRBC-Sailfish DAG ─────────────────────────────────────────────────────────
+// Separate from the generic DAG; stores round→hash index only, so DAG::insert
+// does a single owned-Vertex move (zero 256 KB copies vs. the two in the generic).
+pub struct PRBCDag {
+    pub rounds: HashMap<u64, Vec<VertexHash>>,
+    pub vertices: HashMap<VertexHash, Vertex>,
+}
+impl PRBCDag {
+    pub fn new() -> Self {
+        Self {
+            rounds: HashMap::new(),
+            vertices: HashMap::new(),
+        }
+    }
+    pub fn insert(&mut self, vertex: Vertex) {
+        let h = vertex.hash.clone();
+        self.rounds.entry(vertex.round).or_default().push(h.clone());
+        self.vertices.insert(h, vertex);
+    }
+    pub fn prune(&mut self, before_round: u64) {
+        let to_remove: Vec<u64> = self.rounds.keys()
+            .filter(|&&r| r < before_round)
+            .cloned()
+            .collect();
+        for r in to_remove {
+            if let Some(hashes) = self.rounds.remove(&r) {
+                for h in hashes {
+                    self.vertices.remove(&h);
+                }
+            }
+        }
+    }
+}
+
 pub struct DAG {
     pub rounds: HashMap<u64, Vec<Vertex>>,
     pub vertices: HashMap<VertexHash, Vertex>,
