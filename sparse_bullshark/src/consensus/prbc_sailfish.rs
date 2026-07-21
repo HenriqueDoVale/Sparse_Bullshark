@@ -78,8 +78,10 @@ pub struct PRBCSailfish {
     // ── PRBC data plane ──────────────────────────────────────────────────────
     // full Vertex bodies received via PRBCPropose or Phase 3 recovery
     prbc_payloads: HashMap<VertexHash, Vertex>,
-    // vertex_hash → edges; populated from any full Vertex we receive
-    known_edges: HashMap<VertexHash, Vec<VertexHash>>,
+    // vertex_hash → edges; HashSet gives O(1) contains() in the commit rule
+    known_edges: HashMap<VertexHash, HashSet<VertexHash>>,
+    // (round, source, is_s1) → sample set; avoids recomputing n SHA-256 ops per round
+    sample_cache: HashMap<(u64, NodeId, bool), HashSet<NodeId>>,
     // hashes whose payload has been locally verified
     execution_ready: HashSet<VertexHash>,
     // consensus-committed vertices that still await payload delivery
@@ -145,6 +147,7 @@ impl PRBCSailfish {
 
             prbc_payloads: HashMap::new(),
             known_edges: HashMap::new(),
+            sample_cache: HashMap::new(),
             execution_ready: HashSet::new(),
             execution_queue: VecDeque::new(),
             recovery_state: HashMap::new(),
@@ -518,7 +521,7 @@ impl PRBCSailfish {
         }
 
         // Record edges for commit counting and causal traversal.
-        self.known_edges.insert(hash.clone(), vertex.edges.clone());
+        self.known_edges.insert(hash.clone(), vertex.edges.iter().cloned().collect());
 
         // Stop any in-flight recovery for this hash.
         self.recovery_state.remove(&hash);
@@ -598,6 +601,7 @@ impl PRBCSailfish {
             self.prbc_payloads.remove(&h);
             self.prbc_votes.remove(&h);
         }
+        self.sample_cache.retain(|(round, _, _), _| *round >= cutoff);
     }
 
     fn commit_causal_history_prbc(&mut self, leader: Vertex) {
@@ -671,7 +675,7 @@ impl PRBCSailfish {
         }
 
         // Store payload and edges (first time we see this propose).
-        self.known_edges.insert(hash.clone(), vertex.edges.clone());
+        self.known_edges.insert(hash.clone(), vertex.edges.iter().cloned().collect());
         self.prbc_payloads.insert(hash.clone(), vertex.clone());
 
         // Race-condition fast path: hash quorum already reached before propose arrived.
@@ -689,8 +693,12 @@ impl PRBCSailfish {
         // Sample verification: am I in S1?
         if self.sample_verification(vertex.round, vertex.source) {
             let my_id = self.environment.my_node.id;
-            let s2_salt = [b"prbc_s2".as_ref(), &my_id.to_be_bytes() as &[u8]].concat();
-            let s2 = self.compute_sample(vertex.round, vertex.source, &s2_salt);
+            if !self.sample_cache.contains_key(&(vertex.round, vertex.source, false)) {
+                let s2_salt = [b"prbc_s2".as_ref(), &my_id.to_be_bytes() as &[u8]].concat();
+                let s2 = self.compute_sample(vertex.round, vertex.source, &s2_salt);
+                self.sample_cache.insert((vertex.round, vertex.source, false), s2);
+            }
+            let s2 = self.sample_cache[&(vertex.round, vertex.source, false)].clone();
 
             let forward_vertex = if self.environment.my_node.behavior == NodeBehavior::Byz2 {
                 // Byz2: tamper the block data but keep the original hash so receivers detect it.
@@ -748,7 +756,8 @@ impl PRBCSailfish {
         vote: PRBCVoteMessage,
         dispatcher_tx: &Sender<DispatchMsg>,
     ) {
-        // When signing is on, verify the Ed25519 signature and use msg.voter as identity.
+        // When signing is on, defer crypto to batch-verify at quorum; only reject
+        // obviously invalid votes (missing sig, unknown voter) here for DoS protection.
         // When off, fall back to the TCP-authenticated sender.
         let voter = if self.sign_votes {
             if vote.signature.is_empty() {
@@ -756,18 +765,12 @@ impl PRBCSailfish {
                     self.environment.my_node.id, sender);
                 return;
             }
-            match self.public_keys.get(&vote.voter).and_then(|pk| {
-                Signature::from_bytes(&vote.signature).ok().and_then(|sig| {
-                    pk.verify(&vote.hash, &sig).ok()
-                })
-            }) {
-                Some(_) => vote.voter,
-                None => {
-                    warn!("[Node {}] PRBC: invalid vote signature from node {}",
-                        self.environment.my_node.id, sender);
-                    return;
-                }
+            if !self.public_keys.contains_key(&vote.voter) {
+                warn!("[Node {}] PRBC: vote from unknown node {}",
+                    self.environment.my_node.id, vote.voter);
+                return;
             }
+            vote.voter
         } else {
             sender
         };
@@ -807,6 +810,31 @@ impl PRBCSailfish {
 
         if votes.len() >= quorum {
             let votes_snapshot = votes.clone();
+            // NLL: `votes` (borrow of prbc_votes) ends here; self.public_keys now accessible.
+
+            if self.sign_votes {
+                let hash_ref: &[u8] = &hash;
+                let mut msgs: Vec<&[u8]> = Vec::with_capacity(votes_snapshot.len());
+                let mut sigs: Vec<Signature> = Vec::with_capacity(votes_snapshot.len());
+                let mut pks: Vec<PublicKey> = Vec::with_capacity(votes_snapshot.len());
+                let mut all_parseable = true;
+                for (voter_id, sig_bytes) in &votes_snapshot {
+                    match (self.public_keys.get(voter_id), Signature::from_bytes(sig_bytes)) {
+                        (Some(pk), Ok(sig)) => {
+                            msgs.push(hash_ref);
+                            sigs.push(sig);
+                            pks.push(*pk);
+                        }
+                        _ => { all_parseable = false; break; }
+                    }
+                }
+                if !all_parseable || ed25519_dalek::verify_batch(&msgs, &sigs, &pks).is_err() {
+                    warn!("[Node {}] PRBC: batch signature verification failed (round={} source={})",
+                        self.environment.my_node.id, round, source);
+                    return;
+                }
+            }
+
             self.on_hash_quorum(round, source, hash, votes_snapshot, dispatcher_tx)
                 .await;
         }
@@ -1012,9 +1040,12 @@ impl PRBCSailfish {
     // ── Probabilistic sampling ────────────────────────────────────────────────
 
     /// Returns true if this node is in sample S1 for the given (round, source).
-    fn sample_verification(&self, round: u64, source: NodeId) -> bool {
-        let s1 = self.compute_sample(round, source, b"prbc_s1");
-        s1.contains(&self.environment.my_node.id)
+    fn sample_verification(&mut self, round: u64, source: NodeId) -> bool {
+        if !self.sample_cache.contains_key(&(round, source, true)) {
+            let s1 = self.compute_sample(round, source, b"prbc_s1");
+            self.sample_cache.insert((round, source, true), s1);
+        }
+        self.sample_cache[&(round, source, true)].contains(&self.environment.my_node.id)
     }
 
     /// Deterministically selects ⌈PRBC_C * √n⌉ node IDs for a given salt.
@@ -1080,7 +1111,7 @@ impl PRBCSailfish {
         self.hash_committed.insert((0, 0), genesis_hash.clone());
         self.hash_committed_by_round.entry(0).or_default().insert(0);
         self.execution_ready.insert(genesis_hash.clone());
-        self.known_edges.insert(genesis_hash.clone(), vec![]);
+        self.known_edges.insert(genesis_hash.clone(), HashSet::new());
         self.prbc_payloads.insert(genesis_hash, genesis);
     }
 
@@ -1352,11 +1383,12 @@ impl PRBCSailfish {
         let private_key = self.private_key.clone();
         let test_flag = self.environment.test_flag;
 
-        // Create a per-peer writer channel.
-        let mut peer_senders: Vec<Option<mpsc::Sender<Vec<u8>>>> = Vec::new();
+        // Each peer writer accepts Arc<Vec<u8>> — cloning the Arc is O(1) regardless
+        // of payload size, eliminating the O(n × block_size) memcopy on every broadcast.
+        let mut peer_senders: Vec<Option<mpsc::Sender<Arc<Vec<u8>>>>> = Vec::new();
         for stream_opt in connections.into_iter() {
             if let Some(mut stream) = stream_opt {
-                let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1000);
+                let (tx, mut rx) = mpsc::channel::<Arc<Vec<u8>>>(1000);
                 peer_senders.push(Some(tx));
                 tokio::spawn(async move {
                     while let Some(data) = rx.recv().await {
@@ -1380,10 +1412,12 @@ impl PRBCSailfish {
                     };
 
                     let length_bytes = (payload.len() as u32).to_be_bytes();
-                    let mut frame = Vec::with_capacity(4 + payload.len() + 64);
-                    frame.extend_from_slice(&length_bytes);
-                    frame.extend_from_slice(&payload);
-                    frame.extend_from_slice(sig.as_ref());
+                    let mut frame_data = Vec::with_capacity(4 + payload.len() + 64);
+                    frame_data.extend_from_slice(&length_bytes);
+                    frame_data.extend_from_slice(&payload);
+                    frame_data.extend_from_slice(sig.as_ref());
+                    // Wrap once in Arc — all broadcast clones are O(1) refcount bumps.
+                    let frame = Arc::new(frame_data);
 
                     match target {
                         None => {
