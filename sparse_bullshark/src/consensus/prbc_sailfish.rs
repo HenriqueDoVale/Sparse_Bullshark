@@ -121,6 +121,12 @@ pub struct PRBCSailfish {
     // Configurable timeouts (ms), read from env vars ROUND_TIMEOUT_MS / RECOVERY_TIMEOUT_MS
     round_timeout_ms: u128,
     recovery_timeout_ms: u128,
+
+    // First messages (PRBCPropose receipts) per round, stored as (source, edges).
+    // The Propose is broadcast to all n nodes, so every node gets the full vertex body
+    // immediately. Commit is triggered on ≥2f+1 first messages — no round-(r+1)
+    // hash-quorum required (mirrors Sailfish paper lines 70-71).
+    prbc_first_messages: HashMap<u64, Vec<(NodeId, Vec<VertexHash>)>>,
 }
 
 impl PRBCSailfish {
@@ -178,6 +184,8 @@ impl PRBCSailfish {
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
             recovery_timeout_ms: std::env::var("RECOVERY_TIMEOUT_MS")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
+
+            prbc_first_messages: HashMap::new(),
         };
         node.add_genesis_block();
         node
@@ -222,6 +230,13 @@ impl PRBCSailfish {
                 } else {
                     let block = self.next_batch().await;
                     let new_vertex = self.create_new_vertex(self.round, block);
+                    // Record own Propose as first message before broadcasting.
+                    {
+                        let fm = self.prbc_first_messages.entry(new_vertex.round).or_default();
+                        if !fm.iter().any(|(src, _)| *src == new_vertex.source) {
+                            fm.push((new_vertex.source, new_vertex.edges.clone()));
+                        }
+                    }
                     self.vertex_timestamps.entry(new_vertex.hash.clone()).or_insert_with(Instant::now);
                     self.dag.insert(new_vertex.clone());
                     self.round += 1;
@@ -560,26 +575,21 @@ impl PRBCSailfish {
         for r in (end_round + 1)..=start_round {
             let leader_id = (r % self.environment.nodes.len() as u64) as NodeId;
 
-            // Leader must be hash-committed.
+            // Leader must be hash-committed so we know which hash to look for.
             let leader_hash = match self.hash_committed.get(&(r, leader_id)).cloned() {
                 Some(h) => h,
                 None => break,
             };
 
-            // Count round-(r+1) vertices whose known edges include leader_hash.
-            // Uses the per-round index for O(n_per_round) instead of O(total) scan.
-            let next_round = r + 1;
-            let votes = self
-                .hash_committed_by_round
-                .get(&next_round)
-                .map_or(0, |sources| {
-                    sources.iter().filter(|&&src| {
-                        self.hash_committed
-                            .get(&(next_round, src))
-                            .and_then(|h| self.known_edges.get(h))
-                            .map_or(false, |edges| edges.contains(&leader_hash))
-                    }).count()
-                });
+            // Count round-(r+1) first messages (Propose receipts) whose edges include
+            // leader_hash. No hash-quorum required for r+1 witnesses — paper §lines 70-71.
+            let first_r1 = self.prbc_first_messages
+                .get(&(r + 1))
+                .cloned()
+                .unwrap_or_default();
+            let votes = first_r1.iter()
+                .filter(|(_, edges)| edges.contains(&leader_hash))
+                .count();
 
             if votes >= self.quorum() {
                 if !self.already_ordered.contains(&leader_hash) {
@@ -588,10 +598,23 @@ impl PRBCSailfish {
                         self.last_ordered_round = r;
                         self.dag.prune(self.last_ordered_round.saturating_sub(4));
                         self.prune_prbc_caches();
+                        self.prbc_first_messages.retain(|&rnd, _| rnd + 4 > self.last_ordered_round);
                     }
                 }
             } else {
-                break;
+                let n = self.environment.nodes.len();
+                let max_possible = votes + n.saturating_sub(first_r1.len());
+                if !first_r1.is_empty() && max_possible < self.quorum() {
+                    // Even if all remaining nodes send their Proposes, threshold unreachable.
+                    warn!("[Node {}] Skipping stuck leader at round {} (leader={}, votes={}/{}, r+1 first_msgs={}/{})",
+                        self.environment.my_node.id, r, leader_id, votes, self.quorum(), first_r1.len(), n);
+                    self.last_ordered_round = r;
+                    self.dag.prune(self.last_ordered_round.saturating_sub(4));
+                    self.prune_prbc_caches();
+                    self.prbc_first_messages.retain(|&rnd, _| rnd + 4 > self.last_ordered_round);
+                } else {
+                    break; // More first messages may arrive
+                }
             }
         }
     }
@@ -690,7 +713,19 @@ impl PRBCSailfish {
         }
 
         // Record edges before vertex is moved.
-        self.known_edges.insert(hash.clone(), vertex.edges.iter().cloned().collect());
+        let vertex_edges: Vec<VertexHash> = vertex.edges.clone();
+        self.known_edges.insert(hash.clone(), vertex_edges.iter().cloned().collect());
+
+        // Record as a first message (source, edges) for the first-messages commit trigger.
+        // The Propose is broadcast to all n nodes, so this fires for every node —
+        // mirrors the Sailfish VAL "first messages" mechanism (paper lines 70-71).
+        {
+            let fm = self.prbc_first_messages.entry(v_round).or_default();
+            if !fm.iter().any(|(src, _)| *src == v_source) {
+                fm.push((v_source, vertex_edges));
+            }
+        }
+        self.try_committing_prbc();
 
         // Build S1→S2 forward payload and target list BEFORE moving vertex.
         let my_id = self.environment.my_node.id;

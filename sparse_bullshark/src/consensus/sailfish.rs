@@ -76,6 +76,11 @@ pub struct Sailfish {
     // batch is missing locally. Keyed by the missing digest; drained when the
     // batch arrives.
     pending_on_batch: HashMap<BatchDigest, Vec<(NodeId, VertexMessage)>>,
+
+    // First messages (VAL/Propose) received per round, stored as (source, edges).
+    // Commit is triggered on ≥2f+1 first messages — no full RBC delivery needed
+    // (Sailfish paper, lines 70-71).
+    first_messages: HashMap<u64, Vec<(NodeId, Vec<VertexHash>)>>,
 }
 
 impl Sailfish {
@@ -128,6 +133,8 @@ impl Sailfish {
                 .map(|v| v.eq_ignore_ascii_case("decoupled")).unwrap_or(false),
             batch_store: BatchStore::new(),
             pending_on_batch: HashMap::new(),
+
+            first_messages: HashMap::new(),
         };
         node.add_genesis_block();
         node
@@ -155,6 +162,7 @@ impl Sailfish {
                 } else {
                     let block = self.next_batch(dispatcher_tx).await;
                     let new_vertex = self.create_new_vertex(self.round, block);
+                    self.record_first_message(&new_vertex);
                     self.vertex_timestamps.entry(new_vertex.hash.clone()).or_insert_with(Instant::now);
                     self.dag.insert(new_vertex.clone());
                     self.round += 1;
@@ -467,43 +475,41 @@ impl Sailfish {
             if let Some(round_vertices) = self.dag.get_round(r) {
                 if let Some(leader) = round_vertices.iter().find(|v| v.source == leader_id) {
                     
-                    // 2. Check for 2f+1 votes in the NEXT round
-                    if let Some(next_round_vertices) = self.dag.get_round(r + 1) {
-                        let votes = next_round_vertices.iter()
-                            .filter(|child| child.edges.contains(&leader.hash))
-                            .count();
-                        
-                        if votes >= 2 * self.f + 1 {
-                            // 3. COMMIT THE CAUSAL HISTORY
-                            if !self.already_ordered.contains(&leader.hash) {
-                                // info!("[Node {}] ⚓ COMMIT Round {} Leader {}", self.environment.my_node.id, r, leader_id);
+                    // 2. Check for ≥2f+1 first messages (VAL receipts) for round r+1
+                    //    that include a strong edge to the leader. No full RBC delivery
+                    //    is required — paper §lines 70-71.
+                    let first_r1 = self.first_messages
+                        .get(&(r + 1))
+                        .cloned()
+                        .unwrap_or_default();
+                    let leader_hash = leader.hash.clone();
+                    let votes = first_r1.iter()
+                        .filter(|(_, edges)| edges.contains(&leader_hash))
+                        .count();
 
-                                // Perform BFS to count ALL blocks this leader pulls in
-                                let committed_count = self.commit_causal_history(leader.clone());
-
-                                self.finalized_block_count += committed_count;
-                                self.last_ordered_round = r;
-                                self.dag.prune(self.last_ordered_round.saturating_sub(4));
-                            }
-                        } else {
-                            // Not enough votes yet. Check if more can still arrive.
-                            let r1_size = self.dag.get_round(r + 1).map_or(0, |v| v.len());
-                            let n = self.environment.nodes.len();
-                            let max_possible = votes + n.saturating_sub(r1_size);
-                            if max_possible < 2 * self.f + 1 {
-                                // Even if every missing node votes, threshold unreachable.
-                                // Byzantine timing attack — skip this leader.
-                                warn!("[Node {}] Skipping stuck leader at round {} (leader={}, votes={}/{}, r+1 DAG={}/{})",
-                                    self.environment.my_node.id, r, leader_id, votes, 2 * self.f + 1, r1_size, n);
-                                self.last_ordered_round = r;
-                                self.dag.prune(self.last_ordered_round.saturating_sub(4));
-                                // continue to next round
-                            } else {
-                                break; // More votes may still arrive
-                            }
+                    if votes >= 2 * self.f + 1 {
+                        // 3. COMMIT THE CAUSAL HISTORY
+                        if !self.already_ordered.contains(&leader_hash) {
+                            let committed_count = self.commit_causal_history(leader.clone());
+                            self.finalized_block_count += committed_count;
+                            self.last_ordered_round = r;
+                            self.dag.prune(self.last_ordered_round.saturating_sub(4));
+                            self.first_messages.retain(|&rnd, _| rnd + 4 > self.last_ordered_round);
                         }
                     } else {
-                        break; // Waiting for next round
+                        let n = self.environment.nodes.len();
+                        let max_possible = votes + n.saturating_sub(first_r1.len());
+                        if !first_r1.is_empty() && max_possible < 2 * self.f + 1 {
+                            // Even counting all remaining first messages, threshold is
+                            // unreachable — skip this leader (Byzantine timing attack).
+                            warn!("[Node {}] Skipping stuck leader at round {} (leader={}, votes={}/{}, r+1 first_msgs={}/{})",
+                                self.environment.my_node.id, r, leader_id, votes, 2 * self.f + 1, first_r1.len(), n);
+                            self.last_ordered_round = r;
+                            self.dag.prune(self.last_ordered_round.saturating_sub(4));
+                            self.first_messages.retain(|&rnd, _| rnd + 4 > self.last_ordered_round);
+                        } else {
+                            break; // More first messages may arrive
+                        }
                     }
                 } else {
                     continue; // TC round — no leader vertex, skip this round's commit
@@ -634,7 +640,13 @@ impl Sailfish {
                     }));
                     
                     let delivered = match msg {
-                        SparseMessage::Vertex(v)    => self.rbc.on_val(sender, v.vertex, &TupleDispatcher(&dispatcher_tx)).await,
+                        SparseMessage::Vertex(v)    => {
+                            // Record first message immediately on VAL receipt; trigger commit
+                            // check without waiting for full RBC delivery (paper lines 70-71).
+                            self.record_first_message(&v.vertex);
+                            self.try_committing_sailfish();
+                            self.rbc.on_val(sender, v.vertex, &TupleDispatcher(&dispatcher_tx)).await
+                        }
                         SparseMessage::RBCEcho(e)   => self.rbc.on_echo(sender, e.vertex_hash, &TupleDispatcher(&dispatcher_tx)).await,
                         SparseMessage::RBCReady(r)  => self.rbc.on_ready(sender, r, &TupleDispatcher(&dispatcher_tx)).await,
                         SparseMessage::RBCVote(v)   => self.rbc.on_vote(v, &TupleDispatcher(&dispatcher_tx)).await,
@@ -742,6 +754,16 @@ impl Sailfish {
                 SparseMessage::Batch(BatchMessage { digest, payload: payload.clone() }),
                 dispatcher_tx,
             ).await;
+        }
+    }
+
+    /// Record a first message (VAL/Propose) for a vertex. Stores (source, edges) once per
+    /// (round, source). Used by try_committing_sailfish to trigger commit without waiting
+    /// for full RBC delivery (Sailfish paper, lines 70-71).
+    fn record_first_message(&mut self, vertex: &Vertex) {
+        let msgs = self.first_messages.entry(vertex.round).or_default();
+        if !msgs.iter().any(|(src, _)| *src == vertex.source) {
+            msgs.push((vertex.source, vertex.edges.clone()));
         }
     }
 
