@@ -5,16 +5,19 @@ use log::{error, info, warn, debug};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::mpsc::{self, Sender},
+    sync::mpsc::{self, Sender, Receiver},
     time::{sleep, timeout, Duration, Instant}, // Added timeout
 };
-use shared::{domain::{environment::Environment, node::NodeBehavior}, transaction_generator::TransactionGenerator};
+use shared::{domain::{environment::Environment, node::NodeBehavior, transaction::Transaction}, transaction_generator::TransactionGenerator};
 use crate::{
     consensus::dag::DAG,
-    consensus::mempool::{BatchStore, BatchDigest, batch_digest, encode_digests, decode_digests},
+    consensus::mempool::{
+        BatchStore, BatchDigest, MempoolMode, SealedBatch,
+        batch_digest, encode_digests, decode_digests, spawn_worker, spawn_quorum_waiter,
+    },
     consensus::rbc::{ReliableBroadcast, TupleDispatcher, bracha::BrachaRbc, signed_vote::SignedVoteRbc},
     network::{broadcast::generate_nonce, message::{
-        SparseMessage, VertexMessage, TimeoutMessage, BatchMessage, BatchRequestMessage,
+        SparseMessage, VertexMessage, TimeoutMessage, BatchMessage, BatchRequestMessage, BatchAckMessage,
     }},
     types::vertex::{NodeId, Vertex, VertexHash, TimeoutCertificate},
 };
@@ -68,14 +71,23 @@ pub struct Sailfish {
     round_timeout_ms: u128,
 
     // --- Decoupled mempool (Narwhal-style data plane) ---
-    // When true, vertices carry only batch digests; payloads are disseminated
-    // out-of-band and cached in `batch_store`. Toggled via MEMPOOL_MODE=decoupled.
-    mempool_decoupled: bool,
+    // inline / decoupled / workers, chosen via MEMPOOL_MODE.
+    mempool_mode: MempoolMode,
     batch_store: BatchStore,
     // Vertices delivered by RBC but not yet insertable because a referenced
     // batch is missing locally. Keyed by the missing digest; drained when the
     // batch arrives.
     pending_on_batch: HashMap<BatchDigest, Vec<(NodeId, VertexMessage)>>,
+
+    // --- Workers mode (phase 2) ---
+    // Digests certified by the QuorumWaiter (2f+1 acks), drained into the next
+    // vertex. None outside workers mode.
+    certified_receiver: Option<Receiver<BatchDigest>>,
+    // Forwards received BatchAcks to the QuorumWaiter. None outside workers mode.
+    ack_sender: Option<Sender<(BatchDigest, NodeId)>>,
+    // Exact count of committed transactions (batches have variable size in
+    // workers mode, so we cannot use finalized_block_count * n_tx).
+    committed_tx_count: usize,
 }
 
 impl Sailfish {
@@ -124,10 +136,13 @@ impl Sailfish {
             round_timeout_ms: std::env::var("ROUND_TIMEOUT_MS")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
 
-            mempool_decoupled: std::env::var("MEMPOOL_MODE")
-                .map(|v| v.eq_ignore_ascii_case("decoupled")).unwrap_or(false),
+            mempool_mode: MempoolMode::from_env(),
             batch_store: BatchStore::new(),
             pending_on_batch: HashMap::new(),
+
+            certified_receiver: None,
+            ack_sender: None,
+            committed_tx_count: 0,
         };
         node.add_genesis_block();
         node
@@ -527,6 +542,13 @@ impl Sailfish {
             // Mark as ordered
             self.already_ordered.insert(v.hash.clone());
             count += 1;
+            // Workers/decoupled: count the actual transactions this vertex carries
+            // (batches have variable size, so finalized_block_count * n_tx is wrong).
+            if self.mempool_mode.uses_digests() {
+                for d in decode_digests(&v.block) {
+                    self.committed_tx_count += self.batch_store.tx_count(&d);
+                }
+            }
             if let Some(ts) = self.vertex_timestamps.remove(&v.hash) {
                 self.total_commit_latency_us += ts.elapsed().as_micros();
                 self.committed_vertex_count += 1;
@@ -548,63 +570,164 @@ impl Sailfish {
 
     // --- STANDARD BOILERPLATE (Network & RBC) ---
     
+    /// Produce the `block` field for a new vertex, per mempool mode.
     async fn next_batch(&mut self, dispatcher_tx: &Sender<SailDispatch>) -> Vec<u8> {
-        // Pull the next serialized batch payload from the generator task.
-        let payload = if let Some(rx) = &mut self.batch_receiver {
+        match self.mempool_mode {
+            MempoolMode::Inline => {
+                // Legacy: the vertex block IS the payload.
+                self.recv_generated_batch().await
+            }
+            MempoolMode::Decoupled => {
+                // Phase 1: cache one batch, disseminate it once off the RBC path,
+                // reference it by digest in the vertex.
+                let payload = self.recv_generated_batch().await;
+                let tx_count = self.environment.n_transactions;
+                let digest = batch_digest(&payload);
+                if !self.batch_store.contains(&digest) {
+                    self.batch_store.insert(digest.clone(), payload.clone(), tx_count);
+                }
+                let _ = dispatcher_tx.send((None, SparseMessage::Batch(BatchMessage {
+                    payload,
+                    tx_count,
+                }))).await;
+                encode_digests(&[digest])
+            }
+            MempoolMode::Workers => {
+                // Phase 2 (Narwhal): pack ALL digests the QuorumWaiter has
+                // certified (2f+1 acks). The batches were already sealed,
+                // disseminated and certified by the parallel worker tasks — here
+                // we only collect their digests. An empty set yields an empty
+                // vertex, which keeps the DAG advancing.
+                let mut digests = Vec::new();
+                if let Some(rx) = &mut self.certified_receiver {
+                    while let Ok(d) = rx.try_recv() {
+                        digests.push(d);
+                    }
+                }
+                encode_digests(&digests)
+            }
+        }
+    }
+
+    /// Pull one serialized batch from the generator task (inline / decoupled modes).
+    async fn recv_generated_batch(&mut self) -> Vec<u8> {
+        if let Some(rx) = &mut self.batch_receiver {
             match rx.try_recv() {
                 Ok(b) => b,
                 Err(_) => rx.recv().await.unwrap_or_default(),
             }
         } else {
             Vec::new()
-        };
-
-        if !self.mempool_decoupled {
-            // Inline (legacy): the vertex block IS the payload.
-            return payload;
         }
-
-        // Decoupled (Narwhal-style): cache the batch locally, disseminate it
-        // once off the RBC critical path, and put only its digest in the vertex.
-        let digest = batch_digest(&payload);
-        if !self.batch_store.contains(&digest) {
-            self.batch_store.insert(digest.clone(), payload.clone());
-        }
-        let _ = dispatcher_tx.send((None, SparseMessage::Batch(BatchMessage {
-            digest: digest.clone(),
-            payload,
-        }))).await;
-        encode_digests(&[digest])
     }
 
-    pub async fn start(mut self) {
-        // Spawn parallel transaction generator
+    /// Workers mode (phase 2): spawn the Narwhal-style parallel mempool —
+    /// k worker tasks that batch + disseminate, a QuorumWaiter that certifies a
+    /// batch once 2f+1 acks arrive, a generator that fans transactions out to the
+    /// workers, and a task that broadcasts each sealed batch and registers it for
+    /// certification. Certified digests are drained by `next_batch`.
+    fn spawn_worker_pipeline(&mut self, dispatcher_tx: &Sender<SailDispatch>) {
+        let num_workers: usize = std::env::var("NUM_WORKERS")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(4).max(1);
+        let batch_txs: usize = std::env::var("WORKER_BATCH_TX")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(self.environment.n_transactions).max(1);
+        let batch_delay: u64 = std::env::var("WORKER_BATCH_DELAY_MS")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+        let quorum = 2 * self.f + 1;
+        let my_id = self.environment.my_node.id;
+
+        let (sealed_tx, mut sealed_rx)   = mpsc::channel::<SealedBatch>(1024);
+        let (register_tx, register_rx)   = mpsc::channel::<BatchDigest>(1024);
+        let (ack_tx, ack_rx)             = mpsc::channel::<(BatchDigest, NodeId)>(4096);
+        let (certified_tx, certified_rx) = mpsc::channel::<BatchDigest>(4096);
+
+        // k parallel workers, each with its own transaction input channel.
+        let mut worker_inputs: Vec<Sender<Transaction>> = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let (in_tx, in_rx) = mpsc::channel::<Transaction>(1024);
+            spawn_worker(in_rx, self.batch_store.clone(), sealed_tx.clone(), batch_txs, batch_delay);
+            worker_inputs.push(in_tx);
+        }
+        drop(sealed_tx); // only the workers keep a sender
+
+        // QuorumWaiter: certify a digest once 2f+1 authorities acknowledge storing it.
+        spawn_quorum_waiter(my_id, quorum, register_rx, ack_rx, certified_tx);
+
+        // Generator: fan individual transactions out to the workers round-robin.
         let tx_size    = self.environment.transaction_size;
         let n_tx       = self.environment.n_transactions;
         let n_nodes    = self.environment.nodes.len() as u64;
         let input_rate = self.environment.input_rate;
-        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-        self.batch_receiver = Some(batch_rx);
-
         tokio::spawn(async move {
             let mut gen = TransactionGenerator::new(tx_size, n_tx);
-            if input_rate > 0 {
-                let per_node_rate = input_rate / n_nodes;
-                let interval_us = (n_tx as u64 * 1_000_000) / per_node_rate;
-                let mut ticker = tokio::time::interval(Duration::from_micros(interval_us));
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    ticker.tick().await;
-                    let batch = bincode::serialize(&gen.generate()).expect("batch serialize failed");
-                    if batch_tx.send(batch).await.is_err() { break; }
-                }
+            let n = worker_inputs.len();
+            let mut rr = 0usize;
+            let mut ticker = if input_rate > 0 {
+                let per_node_rate = (input_rate / n_nodes).max(1);
+                let interval_us = ((n_tx as u64 * 1_000_000) / per_node_rate).max(1);
+                let mut t = tokio::time::interval(Duration::from_micros(interval_us));
+                t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                Some(t)
             } else {
-                loop {
-                    let batch = bincode::serialize(&gen.generate()).expect("batch serialize failed");
-                    if batch_tx.send(batch).await.is_err() { break; }
+                None
+            };
+            loop {
+                if let Some(t) = ticker.as_mut() { t.tick().await; }
+                for tx in gen.generate() {
+                    if worker_inputs[rr % n].send(tx).await.is_err() { return; }
+                    rr = rr.wrapping_add(1);
                 }
             }
         });
+
+        // Disseminate each sealed batch once (off the RBC path) and register it.
+        let dispatch = dispatcher_tx.clone();
+        tokio::spawn(async move {
+            while let Some(sealed) = sealed_rx.recv().await {
+                let _ = dispatch.send((None, SparseMessage::Batch(BatchMessage {
+                    payload:  sealed.payload,
+                    tx_count: sealed.tx_count,
+                }))).await;
+                let _ = register_tx.send(sealed.digest).await;
+            }
+        });
+
+        self.certified_receiver = Some(certified_rx);
+        self.ack_sender = Some(ack_tx);
+    }
+
+    pub async fn start(mut self) {
+        // Inline / decoupled modes: a single generator produces one serialized
+        // batch per round into `batch_receiver`. Workers mode wires its own
+        // parallel pipeline below (after the dispatcher exists).
+        if self.mempool_mode != MempoolMode::Workers {
+            let tx_size    = self.environment.transaction_size;
+            let n_tx       = self.environment.n_transactions;
+            let n_nodes    = self.environment.nodes.len() as u64;
+            let input_rate = self.environment.input_rate;
+            let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+            self.batch_receiver = Some(batch_rx);
+
+            tokio::spawn(async move {
+                let mut gen = TransactionGenerator::new(tx_size, n_tx);
+                if input_rate > 0 {
+                    let per_node_rate = input_rate / n_nodes;
+                    let interval_us = (n_tx as u64 * 1_000_000) / per_node_rate;
+                    let mut ticker = tokio::time::interval(Duration::from_micros(interval_us));
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        ticker.tick().await;
+                        let batch = bincode::serialize(&gen.generate()).expect("batch serialize failed");
+                        if batch_tx.send(batch).await.is_err() { break; }
+                    }
+                } else {
+                    loop {
+                        let batch = bincode::serialize(&gen.generate()).expect("batch serialize failed");
+                        if batch_tx.send(batch).await.is_err() { break; }
+                    }
+                }
+            });
+        }
 
         let address = format!("{}:{}", self.environment.my_node.host, self.environment.my_node.port);
         let listener = TcpListener::bind(&address).await.expect("Failed to bind");
@@ -614,6 +737,12 @@ impl Sailfish {
         sleep(Duration::from_secs(SOCKET_BINDING_DELAY)).await;
         let connections = self.connect(message_tx.clone(), &listener).await;
         self.start_message_dispatcher(dispatcher_rx, connections);
+
+        // Workers mode (phase 2): spin up the Narwhal-style parallel mempool now
+        // that the dispatcher exists (workers disseminate batches through it).
+        if self.mempool_mode == MempoolMode::Workers {
+            self.spawn_worker_pipeline(&dispatcher_tx);
+        }
 
         let start_time = Instant::now();
         let duration = Duration::from_secs(EXECUTION_DURATION);
@@ -641,8 +770,9 @@ impl Sailfish {
                         SparseMessage::RBCCommit(c) => self.rbc.on_commit(c, &TupleDispatcher(&dispatcher_tx)).await,
                         SparseMessage::Timeout(t)   => { self.handle_timeout_vote(sender, t.round, t.signature).await; None }
                         SparseMessage::Commit(_)    => None,
-                        SparseMessage::Batch(b)        => { self.handle_batch(b.digest, b.payload, &dispatcher_tx).await; None }
+                        SparseMessage::Batch(b)        => { self.handle_batch(sender, b.payload, b.tx_count, &dispatcher_tx).await; None }
                         SparseMessage::BatchRequest(r) => { self.handle_batch_request(sender, r.digest, &dispatcher_tx).await; None }
+                        SparseMessage::BatchAck(a)     => { if let Some(tx) = &self.ack_sender { let _ = tx.send((a.digest, sender)).await; } None }
                     };
                     if let Some(vertex) = delivered {
                         self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }, &dispatcher_tx).await;
@@ -687,7 +817,7 @@ impl Sailfish {
     /// Digests a vertex references that are not yet in the local batch store.
     /// Always empty in inline mode (the payload travels inside the vertex).
     fn missing_batches(&self, v: &Vertex) -> Vec<BatchDigest> {
-        if !self.mempool_decoupled { return Vec::new(); }
+        if self.mempool_mode == MempoolMode::Inline { return Vec::new(); }
         decode_digests(&v.block)
             .into_iter()
             .filter(|d| !self.batch_store.contains(d))
@@ -715,11 +845,19 @@ impl Sailfish {
 
     /// A batch arrived (via dissemination or a pull reply): cache it and retry
     /// any vertices that were waiting on it.
-    async fn handle_batch(&mut self, digest: BatchDigest, payload: Vec<u8>, dispatcher_tx: &Sender<SailDispatch>) {
+    async fn handle_batch(&mut self, from: NodeId, payload: Vec<u8>, tx_count: usize, dispatcher_tx: &Sender<SailDispatch>) {
+        // The digest is derived from the payload (only B is sent on the wire).
+        let digest = batch_digest(&payload);
         if !self.batch_store.contains(&digest) {
-            if batch_digest(&payload) != digest { return; } // integrity: digest must match payload
-            self.batch_store.insert(digest.clone(), payload);
+            self.batch_store.insert(digest.clone(), payload, tx_count);
         }
+
+        // Workers mode: acknowledge storage so the batch's author can certify it
+        // (2f+1 acks → availability certificate before the digest is proposed).
+        if self.mempool_mode == MempoolMode::Workers {
+            self.unicast(from, SparseMessage::BatchAck(BatchAckMessage { digest: digest.clone() }), dispatcher_tx).await;
+        }
+
         if let Some(waiters) = self.pending_on_batch.remove(&digest) {
             for (sender, vm) in waiters {
                 if self.missing_batches(&vm.vertex).is_empty() {
@@ -736,10 +874,11 @@ impl Sailfish {
 
     /// Answer a peer's pull request for a batch we hold.
     async fn handle_batch_request(&self, requester: NodeId, digest: BatchDigest, dispatcher_tx: &Sender<SailDispatch>) {
-        if let Some(payload) = self.batch_store.get(&digest) {
+        if let Some(payload) = self.batch_store.get_payload(&digest) {
+            let tx_count = self.batch_store.tx_count(&digest);
             self.unicast(
                 requester,
-                SparseMessage::Batch(BatchMessage { digest, payload: payload.clone() }),
+                SparseMessage::Batch(BatchMessage { payload, tx_count }),
                 dispatcher_tx,
             ).await;
         }
@@ -979,7 +1118,12 @@ impl Sailfish {
         let n_tx       = self.environment.n_transactions;
         let exec_secs  = EXECUTION_DURATION as f64;
 
-        let total_tx    = self.finalized_block_count * n_tx;
+        // Inline: every committed vertex carries n_tx transactions. Decoupled /
+        // workers: batches have variable size, so use the exact committed count.
+        let total_tx    = match self.mempool_mode {
+            MempoolMode::Inline => self.finalized_block_count * n_tx,
+            _ => self.committed_tx_count,
+        };
         let total_bytes = total_tx * tx_size;
         let tps         = total_tx as f64 / exec_secs;
         let bps         = total_bytes as f64 / exec_secs;
@@ -994,11 +1138,13 @@ impl Sailfish {
 
         let rbc_label = self.rbc.name();
 
-        let mempool_label = if self.mempool_decoupled { "decoupled (digests)" } else { "inline (payload)" };
-
         println!("\n+ CONFIG:");
         println!("  Protocol:             Sailfish ({} RBC)", rbc_label);
-        println!("  Mempool:              {}", mempool_label);
+        println!("  Mempool:              {}", self.mempool_mode.label());
+        if self.mempool_mode == MempoolMode::Workers {
+            let num_workers = std::env::var("NUM_WORKERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).max(1);
+            println!("  Workers:              {}", num_workers);
+        }
         println!("  Faults:               {} node(s)", f_actual);
         println!("  Fault tolerance:      {} node(s)", f_tolerance);
         println!("  Committee size:       {} node(s)", n);
@@ -1018,7 +1164,7 @@ impl Sailfish {
         println!("  Consensus TPS:        {:.0} tx/s", tps);
         println!("  Consensus BPS:        {:.0} B/s", bps);
         println!("  Consensus latency:    {:.1} ms", avg_latency_ms);
-        if self.mempool_decoupled {
+        if self.mempool_mode.uses_digests() {
             println!("  Batches cached:       {}", self.batch_store.len());
         }
     }

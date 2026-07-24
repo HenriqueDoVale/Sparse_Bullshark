@@ -165,10 +165,10 @@ async def run_node(node_id, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, 
         env["INPUT_RATE"] = str(input_rate)
     if mode == "sailfish":
         env["RBC_MODE"] = rbc
-        # Narwhal-style decoupled mempool (Sailfish only): vertices carry batch
-        # digests, payloads travel out-of-band. Unset keeps the inline behavior.
-        if mempool == "decoupled":
-            env["MEMPOOL_MODE"] = "decoupled"
+        # Narwhal-style mempool (Sailfish only): vertices carry batch digests,
+        # payloads travel out-of-band. 'inline' (unset) keeps the legacy behavior.
+        if mempool != "inline":
+            env["MEMPOOL_MODE"] = mempool
     if mode == "prbc_sailfish" and no_prbc_sigs:
         env["PRBC_SIGS"] = "off"
     env["ROUND_TIMEOUT_MS"] = str(timeout_ms)
@@ -220,12 +220,18 @@ async def main():
                         help="Disable Ed25519 vote signatures in PRBC-Sailfish (ignored for sailfish)")
     parser.add_argument("--timeout", type=int, default=500,
                         help="Round timeout in ms for both protocols (default: 500)")
-    parser.add_argument("--mempool", choices=["inline", "decoupled"], default="inline",
+    parser.add_argument("--mempool", choices=["inline", "workers"], default="inline",
                         help="Sailfish mempool: 'inline' (payload in vertex, legacy) or "
-                             "'decoupled' (Narwhal-style, vertex carries batch digests). Ignored for prbc_sailfish.")
+                             "'workers' (Narwhal-style parallel workers + 2f+1 batch certificates). Ignored for prbc_sailfish.")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="Number of mempool workers (workers mode only; 0 = binary default of 4)")
     parser.add_argument("--logs", action="store_true",
                         help="Print captured stderr (warn/error logs) from each node after results")
     args = parser.parse_args()
+
+    # Workers-mode tuning: exported here so run_node's os.environ.copy() inherits it.
+    if args.workers > 0:
+        os.environ["NUM_WORKERS"] = str(args.workers)
 
     for path in [KEYS_FILE, NODES_CSV]:
         if not os.path.exists(path):

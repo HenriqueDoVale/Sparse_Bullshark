@@ -60,14 +60,25 @@ pub struct RBCCommitMessage {
 /// re-forwarded with every RBC echo/vote/ready.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BatchMessage {
-    pub digest:  VertexHash,
-    pub payload: Vec<u8>,   // bincode(Vec<Transaction>)
+    // Only the payload travels. The digest H(payload) is recomputed by the
+    // receiver — there is no need to also send H(B) alongside B, since the
+    // vertex already carries it and anyone can hash B locally.
+    pub payload:  Vec<u8>,   // bincode(Vec<Transaction>)
+    pub tx_count: usize,     // number of transactions in the batch (for throughput accounting)
 }
 
 /// Pull request for a batch a node is missing (it received a vertex referencing
 /// a digest it does not yet hold). Answered with a unicast `BatchMessage`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BatchRequestMessage {
+    pub digest: VertexHash,
+}
+
+/// Acknowledgement that the sender has stored a batch (Narwhal-style workers mode).
+/// The batch's author collects 2f+1 of these to certify the batch's availability
+/// before referencing its digest in a vertex.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BatchAckMessage {
     pub digest: VertexHash,
 }
 
@@ -83,4 +94,5 @@ pub enum SparseMessage {
     Commit(CommitMessage),
     Batch(BatchMessage),               // Decoupled mempool: batch dissemination
     BatchRequest(BatchRequestMessage), // Decoupled mempool: pull a missing batch
+    BatchAck(BatchAckMessage),         // Workers mempool: 2f+1 availability certificate
 }

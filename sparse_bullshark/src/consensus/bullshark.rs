@@ -199,7 +199,7 @@ impl Bullshark {
                             SparseMessage::Commit(_) => None,
                             SparseMessage::Timeout(_) => None,
                             // Decoupled mempool is Sailfish-only; ignore here.
-                            SparseMessage::Batch(_) | SparseMessage::BatchRequest(_) => None,
+                            SparseMessage::Batch(_) | SparseMessage::BatchRequest(_) | SparseMessage::BatchAck(_) => None,
                         };
                         if let Some(vertex) = delivered {
                             self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }).await;
