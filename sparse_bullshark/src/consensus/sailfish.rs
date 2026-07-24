@@ -28,6 +28,9 @@ const MESSAGE_CHANNEL_SIZE: usize = 1024;
 const SOCKET_BINDING_DELAY: u64 = 2;
 const MESSAGE_BYTES_LENGTH: usize = 4;
 const EXECUTION_DURATION: u64 = 60;
+// Number of parallel mempool workers in `workers` mode. Change this value to
+// tune the worker parallelism (compile-time constant, like PRBC_C in PRBC).
+const NUM_WORKERS: usize = 8;
 
 // Dispatcher channel: None = broadcast to all; Some(id) = unicast to that peer.
 type SailDispatch = (Option<NodeId>, SparseMessage);
@@ -627,8 +630,7 @@ impl Sailfish {
     /// workers, and a task that broadcasts each sealed batch and registers it for
     /// certification. Certified digests are drained by `next_batch`.
     fn spawn_worker_pipeline(&mut self, dispatcher_tx: &Sender<SailDispatch>) {
-        let num_workers: usize = std::env::var("NUM_WORKERS")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(4).max(1);
+        let num_workers: usize = NUM_WORKERS.max(1);
         let batch_txs: usize = std::env::var("WORKER_BATCH_TX")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(self.environment.n_transactions).max(1);
         let batch_delay: u64 = std::env::var("WORKER_BATCH_DELAY_MS")
@@ -1142,8 +1144,7 @@ impl Sailfish {
         println!("  Protocol:             Sailfish ({} RBC)", rbc_label);
         println!("  Mempool:              {}", self.mempool_mode.label());
         if self.mempool_mode == MempoolMode::Workers {
-            let num_workers = std::env::var("NUM_WORKERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).max(1);
-            println!("  Workers:              {}", num_workers);
+            println!("  Workers:              {}", NUM_WORKERS.max(1));
         }
         println!("  Faults:               {} node(s)", f_actual);
         println!("  Fault tolerance:      {} node(s)", f_tolerance);

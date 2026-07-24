@@ -223,15 +223,9 @@ async def main():
     parser.add_argument("--mempool", choices=["inline", "workers"], default="inline",
                         help="Sailfish mempool: 'inline' (payload in vertex, legacy) or "
                              "'workers' (Narwhal-style parallel workers + 2f+1 batch certificates). Ignored for prbc_sailfish.")
-    parser.add_argument("--workers", type=int, default=0,
-                        help="Number of mempool workers (workers mode only; 0 = binary default of 4)")
     parser.add_argument("--logs", action="store_true",
                         help="Print captured stderr (warn/error logs) from each node after results")
     args = parser.parse_args()
-
-    # Workers-mode tuning: exported here so run_node's os.environ.copy() inherits it.
-    if args.workers > 0:
-        os.environ["NUM_WORKERS"] = str(args.workers)
 
     for path in [KEYS_FILE, NODES_CSV]:
         if not os.path.exists(path):
