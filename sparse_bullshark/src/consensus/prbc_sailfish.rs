@@ -772,21 +772,21 @@ impl PRBCSailfish {
         vote: PRBCVoteMessage,
         dispatcher_tx: &Sender<DispatchMsg>,
     ) {
-        // When signing is on, defer crypto to batch-verify at quorum; only reject
-        // obviously invalid votes (missing sig, unknown voter) here for DoS protection.
+        // When signing is on, verify the Ed25519 signature and use msg.voter as identity.
         // When off, fall back to the TCP-authenticated sender.
         let voter = if self.sign_votes {
-            if vote.signature.is_empty() {
-                warn!("[Node {}] PRBC: vote from {} missing signature (PRBC_SIGS=on)",
-                    self.environment.my_node.id, sender);
-                return;
+            match self.public_keys.get(&vote.voter).and_then(|pk| {
+                Signature::from_bytes(&vote.signature).ok().and_then(|sig| {
+                    pk.verify(&vote.hash, &sig).ok()
+                })
+            }) {
+                Some(_) => vote.voter,
+                None => {
+                    warn!("[Node {}] PRBC: invalid vote signature from node {}",
+                        self.environment.my_node.id, sender);
+                    return;
+                }
             }
-            if !self.public_keys.contains_key(&vote.voter) {
-                warn!("[Node {}] PRBC: vote from unknown node {}",
-                    self.environment.my_node.id, vote.voter);
-                return;
-            }
-            vote.voter
         } else {
             sender
         };
@@ -826,31 +826,7 @@ impl PRBCSailfish {
 
         if votes.len() >= quorum {
             let votes_snapshot = votes.clone();
-            // NLL: `votes` (borrow of prbc_votes) ends here; self.public_keys now accessible.
-
-            if self.sign_votes {
-                let hash_ref: &[u8] = &hash;
-                let mut msgs: Vec<&[u8]> = Vec::with_capacity(votes_snapshot.len());
-                let mut sigs: Vec<Signature> = Vec::with_capacity(votes_snapshot.len());
-                let mut pks: Vec<PublicKey> = Vec::with_capacity(votes_snapshot.len());
-                let mut all_parseable = true;
-                for (voter_id, sig_bytes) in &votes_snapshot {
-                    match (self.public_keys.get(voter_id), Signature::from_bytes(sig_bytes)) {
-                        (Some(pk), Ok(sig)) => {
-                            msgs.push(hash_ref);
-                            sigs.push(sig);
-                            pks.push(*pk);
-                        }
-                        _ => { all_parseable = false; break; }
-                    }
-                }
-                if !all_parseable || ed25519_dalek::verify_batch(&msgs, &sigs, &pks).is_err() {
-                    warn!("[Node {}] PRBC: batch signature verification failed (round={} source={})",
-                        self.environment.my_node.id, round, source);
-                    return;
-                }
-            }
-
+            // NLL: `votes` (borrow of prbc_votes) ends here.
             self.on_hash_quorum(round, source, hash, votes_snapshot, dispatcher_tx)
                 .await;
         }
