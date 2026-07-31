@@ -103,10 +103,15 @@ pub struct PRBCSailfish {
     already_ordered: HashSet<VertexHash>,
     total_bytes_created: u64,
 
-    // Latency tracking
+    // Consensus latency tracking (vertex creation → commit, all vertices)
     vertex_timestamps: HashMap<VertexHash, Instant>,
     total_commit_latency_us: u128,
     committed_vertex_count: u64,
+
+    // E2E latency tracking (batch dequeued → commit, own vertices only)
+    e2e_timestamps: HashMap<VertexHash, Instant>,
+    total_e2e_latency_us: u128,
+    e2e_committed_count: u64,
 
     // Diagnostic counters (printed in stats, medianised by run_linux.py)
     recovery_triggered_count: usize, // Phase 3 recovery started (no payload at hash-quorum)
@@ -168,6 +173,10 @@ impl PRBCSailfish {
             total_commit_latency_us: 0,
             committed_vertex_count: 0,
 
+            e2e_timestamps: HashMap::new(),
+            total_e2e_latency_us: 0,
+            e2e_committed_count: 0,
+
             recovery_triggered_count: 0,
             race_condition_count: 0,
 
@@ -221,8 +230,10 @@ impl PRBCSailfish {
                     warn!("[Node {}] SILENT: skipped PRBC propose for round {}", my_id, self.round - 1);
                 } else {
                     let block = self.next_batch().await;
+                    let batch_time = Instant::now(); // E2E start: transactions dequeued, ready to propose
                     let new_vertex = self.create_new_vertex(self.round, block);
                     self.vertex_timestamps.entry(new_vertex.hash.clone()).or_insert_with(Instant::now);
+                    self.e2e_timestamps.insert(new_vertex.hash.clone(), batch_time);
                     self.dag.insert(new_vertex.clone());
                     self.round += 1;
                     self.round_start_time = Instant::now();
@@ -625,6 +636,10 @@ impl PRBCSailfish {
             if let Some(ts) = self.vertex_timestamps.remove(&h) {
                 self.total_commit_latency_us += ts.elapsed().as_micros();
                 self.committed_vertex_count += 1;
+            }
+            if let Some(ts) = self.e2e_timestamps.remove(&h) {
+                self.total_e2e_latency_us += ts.elapsed().as_micros();
+                self.e2e_committed_count += 1;
             }
 
             // Two-tiered state:
@@ -1492,6 +1507,9 @@ impl PRBCSailfish {
         let avg_latency_ms = if self.committed_vertex_count > 0 {
             (self.total_commit_latency_us as f64 / self.committed_vertex_count as f64) / 1000.0
         } else { 0.0 };
+        let avg_e2e_ms = if self.e2e_committed_count > 0 {
+            (self.total_e2e_latency_us as f64 / self.e2e_committed_count as f64) / 1000.0
+        } else { 0.0 };
 
         let quorum_label = if self.reduced_quorum { "f+1" } else { "2f+1" };
         println!("\n+ CONFIG:");
@@ -1511,6 +1529,7 @@ impl PRBCSailfish {
         println!("  Consensus TPS:        {:.0} tx/s", con_tps);
         println!("  Consensus BPS:        {:.0} B/s", con_bps);
         println!("  Consensus latency:    {:.1} ms", avg_latency_ms);
+        println!("  E2E latency:          {:.1} ms", avg_e2e_ms);
         println!("  Execution TPS:        {:.0} tx/s", exe_tps);
         println!("  Execution BPS:        {:.0} B/s", exe_bps);
         println!("  Phase-3 recoveries:   {}", self.recovery_triggered_count);
