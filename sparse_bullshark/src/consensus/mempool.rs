@@ -55,6 +55,10 @@ impl BatchStore {
         self.batches.get(digest)
     }
 
+    pub fn remove(&mut self, digest: &[u8]) {
+        self.batches.remove(digest);
+    }
+
     pub fn len(&self) -> usize {
         self.batches.len()
     }

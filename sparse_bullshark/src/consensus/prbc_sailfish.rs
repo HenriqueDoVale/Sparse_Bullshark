@@ -611,7 +611,10 @@ impl PRBCSailfish {
     /// Window of 50 rounds gives ~8 s at 6 rounds/s, enough for all recovery retries
     /// (9 peers × 500 ms recovery timeout = 4.5 s worst case).
     fn prune_prbc_caches(&mut self) {
-        let cutoff = self.last_ordered_round.saturating_sub(50);
+        // Keep only enough rounds to cover the worst-case recovery time.
+        // 9 peers × 500 ms retry = 4.5 s. At 1.2 rounds/s (n=50) that is ~6 rounds;
+        // using 10 gives a 2× safety margin while cutting memory 5× vs the old 50.
+        let cutoff = self.last_ordered_round.saturating_sub(10);
         let to_remove: Vec<VertexHash> = self.prbc_payloads
             .iter()
             .filter(|(_, v)| v.round < cutoff)
@@ -1166,8 +1169,8 @@ impl PRBCSailfish {
             }
         });
 
-        let connections = self.connect(message_tx.clone(), &listener).await;
-        self.start_message_dispatcher(dispatcher_rx, connections);
+        let (data_connections, ctrl_connections) = self.connect(message_tx.clone(), &listener).await;
+        self.start_message_dispatcher(dispatcher_rx, data_connections, ctrl_connections);
 
         let start_time = Instant::now();
         let duration = Duration::from_secs(EXECUTION_DURATION);
@@ -1240,20 +1243,22 @@ impl PRBCSailfish {
         std::process::exit(0);
     }
 
+    // Returns (data_connections, ctrl_connections): one TcpStream per peer per plane.
+    // plane=1 connections carry PRBCPropose / PRBCRecoveryResp (large frames).
+    // plane=0 connections carry votes, timeouts, and recovery requests (small frames).
+    // Keeping them separate prevents a 257 KB propose from head-of-line-blocking a vote.
     async fn connect(
         &self,
         message_sender: Sender<(NodeId, PRBCMessage)>,
         listener: &TcpListener,
-    ) -> Vec<Option<TcpStream>> {
+    ) -> (Vec<Option<TcpStream>>, Vec<Option<TcpStream>>) {
         let n_nodes = self.environment.nodes.len();
         let my_id = self.environment.my_node.id;
 
-        let mut connections = Vec::with_capacity(n_nodes);
-        for _ in 0..n_nodes {
-            connections.push(None);
-        }
+        let mut data_connections: Vec<Option<TcpStream>> = (0..n_nodes).map(|_| None).collect();
+        let mut ctrl_connections: Vec<Option<TcpStream>> = (0..n_nodes).map(|_| None).collect();
 
-        // Outgoing connections (background retry loop)
+        // Outgoing: two connections per peer — one per plane.
         let mut outgoing_tasks = Vec::new();
         for node in &self.environment.nodes {
             if node.id == my_id {
@@ -1261,64 +1266,71 @@ impl PRBCSailfish {
             }
             let target_id = node.id;
             let address = format!("{}:{}", node.host, node.port);
-            let private_key = self.private_key.clone();
 
-            let task = tokio::spawn(async move {
-                loop {
-                    if let Ok(mut stream) = TcpStream::connect(&address).await {
-                        let nonce = generate_nonce();
-                        let signature = private_key.sign(&nonce);
-                        if stream.write_all(&my_id.to_be_bytes()).await.is_err() {
-                            sleep(Duration::from_millis(500)).await;
-                            continue;
+            for plane in [0u8, 1u8] {
+                let address = address.clone();
+                let private_key = self.private_key.clone();
+                let task = tokio::spawn(async move {
+                    loop {
+                        if let Ok(mut stream) = TcpStream::connect(&address).await {
+                            let nonce = generate_nonce();
+                            let signature = private_key.sign(&nonce);
+                            if stream.write_all(&my_id.to_be_bytes()).await.is_err() {
+                                sleep(Duration::from_millis(500)).await;
+                                continue;
+                            }
+                            if stream.write_all(&[plane]).await.is_err() {
+                                sleep(Duration::from_millis(500)).await;
+                                continue;
+                            }
+                            if stream.write_all(&nonce).await.is_err() {
+                                sleep(Duration::from_millis(500)).await;
+                                continue;
+                            }
+                            if stream.write_all(signature.as_ref()).await.is_err() {
+                                sleep(Duration::from_millis(500)).await;
+                                continue;
+                            }
+                            return (target_id, plane, Some(stream));
                         }
-                        if stream.write_all(&nonce).await.is_err() {
-                            sleep(Duration::from_millis(500)).await;
-                            continue;
-                        }
-                        if stream.write_all(signature.as_ref()).await.is_err() {
-                            sleep(Duration::from_millis(500)).await;
-                            continue;
-                        }
-                        return (target_id, Some(stream));
+                        sleep(Duration::from_millis(500)).await;
                     }
-                    sleep(Duration::from_millis(500)).await;
-                }
-            });
-            outgoing_tasks.push(task);
+                });
+                outgoing_tasks.push(task);
+            }
         }
 
-        // Incoming connections
+        // Incoming: now 2×(n-1) connections, one per peer per plane.
+        // All connections feed the same message_rx — the plane byte is read for wire
+        // alignment but we don't need to route on the receive side.
         let mut accepted = 0;
-        let expected_peers = n_nodes - 1;
-        info!("[Node {}] Waiting for {} connections...", my_id, expected_peers);
+        let expected_connections = 2 * (n_nodes - 1);
+        info!("[Node {}] Waiting for {} connections...", my_id, expected_connections);
 
-        while accepted < expected_peers {
+        while accepted < expected_connections {
             if let Ok((mut stream, addr)) = listener.accept().await {
                 let mut id_buf = [0u8; 4];
                 if stream.read_exact(&mut id_buf).await.is_err() {
-                    warn!(
-                        "[Node {}] Handshake failed: could not read ID from {}.",
-                        my_id, addr
-                    );
+                    warn!("[Node {}] Handshake failed: could not read ID from {}.", my_id, addr);
                     continue;
                 }
                 let claimed_id = u32::from_be_bytes(id_buf);
 
+                // Consume the plane byte for wire alignment (not used on the receive side).
+                let mut plane_buf = [0u8; 1];
+                if stream.read_exact(&mut plane_buf).await.is_err() {
+                    warn!("[Node {}] Handshake failed: could not read plane from Node {}.", my_id, claimed_id);
+                    continue;
+                }
+
                 let mut nonce = vec![0u8; NONCE_BYTES_LENGTH];
                 if stream.read_exact(&mut nonce).await.is_err() {
-                    warn!(
-                        "[Node {}] Handshake failed: could not read nonce from Node {}.",
-                        my_id, claimed_id
-                    );
+                    warn!("[Node {}] Handshake failed: could not read nonce from Node {}.", my_id, claimed_id);
                     continue;
                 }
                 let mut sig_bytes = vec![0u8; SIGNATURE_BYTES_LENGTH];
                 if stream.read_exact(&mut sig_bytes).await.is_err() {
-                    warn!(
-                        "[Node {}] Handshake failed: could not read signature from Node {}.",
-                        my_id, claimed_id
-                    );
+                    warn!("[Node {}] Handshake failed: could not read signature from Node {}.", my_id, claimed_id);
                     continue;
                 }
 
@@ -1329,37 +1341,30 @@ impl PRBCSailfish {
                             let pks = self.public_keys.clone();
                             let test_flag = self.environment.test_flag;
                             tokio::spawn(async move {
-                                Self::handle_connection(
-                                    stream, msg_sender, my_id, claimed_id, pks, test_flag,
-                                )
-                                .await;
+                                Self::handle_connection(stream, msg_sender, my_id, claimed_id, pks, test_flag).await;
                             });
                             accepted += 1;
-                            info!(
-                                "[Node {}] Accepted connection from Node {} ({}/{})",
-                                my_id, claimed_id, accepted, expected_peers
-                            );
+                            info!("[Node {}] Accepted connection from Node {} ({}/{})",
+                                my_id, claimed_id, accepted, expected_connections);
                         } else {
-                            warn!(
-                                "[Node {}] Handshake failed: INVALID SIGNATURE from Node {}.",
-                                my_id, claimed_id
-                            );
+                            warn!("[Node {}] Handshake failed: INVALID SIGNATURE from Node {}.", my_id, claimed_id);
                         }
                     }
                 } else {
-                    warn!(
-                        "[Node {}] Handshake failed: Unknown Node ID {}.",
-                        my_id, claimed_id
-                    );
+                    warn!("[Node {}] Handshake failed: Unknown Node ID {}.", my_id, claimed_id);
                 }
             }
         }
 
         for task in outgoing_tasks {
-            let (id, stream) = task.await.unwrap();
-            connections[id as usize] = stream;
+            let (id, plane, stream) = task.await.unwrap();
+            if plane == 1 {
+                data_connections[id as usize] = stream;
+            } else {
+                ctrl_connections[id as usize] = stream;
+            }
         }
-        connections
+        (data_connections, ctrl_connections)
     }
 
     async fn handle_connection(
@@ -1408,29 +1413,35 @@ impl PRBCSailfish {
     fn start_message_dispatcher(
         &self,
         mut dispatcher_rx: mpsc::Receiver<DispatchMsg>,
-        connections: Vec<Option<TcpStream>>,
+        data_connections: Vec<Option<TcpStream>>,
+        ctrl_connections: Vec<Option<TcpStream>>,
     ) {
         let private_key = self.private_key.clone();
         let test_flag = self.environment.test_flag;
 
-        // Each peer writer accepts Arc<Vec<u8>> — cloning the Arc is O(1) regardless
-        // of payload size, eliminating the O(n × block_size) memcopy on every broadcast.
-        let mut peer_senders: Vec<Option<mpsc::Sender<Arc<Vec<u8>>>>> = Vec::new();
-        for stream_opt in connections.into_iter() {
-            if let Some(mut stream) = stream_opt {
-                let (tx, mut rx) = mpsc::channel::<Arc<Vec<u8>>>(1000);
-                peer_senders.push(Some(tx));
-                tokio::spawn(async move {
-                    while let Some(data) = rx.recv().await {
-                        if stream.write_all(&data).await.is_err() {
-                            break;
+        // Build one write task per peer per plane. Each writer drains its own queue
+        // independently, so a large propose frame on the data channel never delays a
+        // vote on the control channel.
+        fn build_senders(
+            connections: Vec<Option<TcpStream>>,
+        ) -> Vec<Option<mpsc::Sender<Arc<Vec<u8>>>>> {
+            connections.into_iter().map(|stream_opt| {
+                stream_opt.map(|mut stream| {
+                    let (tx, mut rx) = mpsc::channel::<Arc<Vec<u8>>>(1000);
+                    tokio::spawn(async move {
+                        while let Some(data) = rx.recv().await {
+                            if stream.write_all(&data).await.is_err() {
+                                break;
+                            }
                         }
-                    }
-                });
-            } else {
-                peer_senders.push(None);
-            }
+                    });
+                    tx
+                })
+            }).collect()
         }
+
+        let data_senders = build_senders(data_connections);
+        let ctrl_senders = build_senders(ctrl_connections);
 
         tokio::spawn(async move {
             while let Some((target, message)) = dispatcher_rx.recv().await {
@@ -1449,25 +1460,31 @@ impl PRBCSailfish {
                     // Wrap once in Arc — all broadcast clones are O(1) refcount bumps.
                     let frame = Arc::new(frame_data);
 
+                    // Large frames (proposes, recovery payloads) go on the data channel;
+                    // small frames (votes, timeouts, recovery requests) go on the control
+                    // channel so they are never queued behind a 257 KB propose.
+                    let senders = match &message {
+                        PRBCMessage::PRBCPropose(_) | PRBCMessage::PRBCRecoveryResp(_) => &data_senders,
+                        _ => &ctrl_senders,
+                    };
+
                     match target {
                         DispatchTarget::All => {
-                            // Broadcast to all connected peers.
-                            for tx in &peer_senders {
+                            for tx in senders {
                                 if let Some(sender) = tx {
                                     let _ = sender.send(frame.clone()).await;
                                 }
                             }
                         }
                         DispatchTarget::One(node_id) => {
-                            // Unicast to a specific peer.
-                            if let Some(Some(sender)) = peer_senders.get(node_id as usize) {
+                            if let Some(Some(sender)) = senders.get(node_id as usize) {
                                 let _ = sender.send(frame).await;
                             }
                         }
                         DispatchTarget::Many(ids) => {
                             // Multicast: single serialize+sign, one Arc clone per target.
                             for node_id in ids {
-                                if let Some(Some(sender)) = peer_senders.get(node_id as usize) {
+                                if let Some(Some(sender)) = senders.get(node_id as usize) {
                                     let _ = sender.send(frame.clone()).await;
                                 }
                             }

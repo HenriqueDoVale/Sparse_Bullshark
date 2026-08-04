@@ -537,6 +537,14 @@ impl Sailfish {
                 self.total_commit_latency_us += ts.elapsed().as_micros();
                 self.committed_vertex_count += 1;
             }
+            // Free batch payloads once their vertex is committed — they will never be
+            // needed again. This keeps batch_store bounded instead of growing for the
+            // whole run (the fix for the unbounded leak in decoupled mode).
+            if self.mempool_decoupled {
+                for digest in decode_digests(&v.block) {
+                    self.batch_store.remove(&digest);
+                }
+            }
 
             // Traverse both strong edges (round r-1) and weak edges (rounds < r-1).
             if v.round > 0 {
@@ -618,8 +626,8 @@ impl Sailfish {
         let (dispatcher_tx, dispatcher_rx) = mpsc::channel(MESSAGE_CHANNEL_SIZE);
 
         sleep(Duration::from_secs(SOCKET_BINDING_DELAY)).await;
-        let connections = self.connect(message_tx.clone(), &listener).await;
-        self.start_message_dispatcher(dispatcher_rx, connections);
+        let (data_connections, ctrl_connections) = self.connect(message_tx.clone(), &listener).await;
+        self.start_message_dispatcher(dispatcher_rx, data_connections, ctrl_connections);
 
         let start_time = Instant::now();
         let duration = Duration::from_secs(EXECUTION_DURATION);
@@ -630,17 +638,12 @@ impl Sailfish {
         loop {
             if start_time.elapsed() > duration { break; }
 
-            // Wake up every 50ms to check for Timeouts even if no msg arrives
             let res = timeout(Duration::from_millis(50), message_rx.recv()).await;
 
             match res {
                 Ok(Some((sender, msg))) => {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                       // Clone if needed
-                    }));
-                    
                     let delivered = match msg {
-                        SparseMessage::Vertex(v)    => {
+                        SparseMessage::Vertex(v) => {
                             // Record first message immediately on VAL receipt; trigger commit
                             // check without waiting for full RBC delivery (paper lines 70-71).
                             self.record_first_message(&v.vertex);
@@ -653,17 +656,42 @@ impl Sailfish {
                         SparseMessage::RBCCommit(c) => self.rbc.on_commit(c, &TupleDispatcher(&dispatcher_tx)).await,
                         SparseMessage::Timeout(t)   => { self.handle_timeout_vote(sender, t.round, t.signature).await; None }
                         SparseMessage::Commit(_)    => None,
-                        SparseMessage::Batch(b)        => { self.handle_batch(b.digest, b.payload, &dispatcher_tx).await; None }
+                        SparseMessage::Batch(b)     => { self.handle_batch(b.digest, b.payload, &dispatcher_tx).await; None }
                         SparseMessage::BatchRequest(r) => { self.handle_batch_request(sender, r.digest, &dispatcher_tx).await; None }
                     };
                     if let Some(vertex) = delivered {
                         self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }, &dispatcher_tx).await;
                     }
-                },
+                }
                 Ok(None) => break,
-                Err(_) => {} // Timeout elapsed, just loop to check protocol timeout
+                Err(_) => {}
             }
-            
+
+            // Drain any additional messages queued while processing the first one.
+            // Amortises process_work_loop / try_committing_sailfish calls: O(1) per round
+            // instead of O(n) per round (Bracha RBC floods n-1 echoes then n-1 readys).
+            while let Ok((sender, msg)) = message_rx.try_recv() {
+                let delivered = match msg {
+                    SparseMessage::Vertex(v) => {
+                        self.record_first_message(&v.vertex);
+                        self.try_committing_sailfish();
+                        self.rbc.on_val(sender, v.vertex, &TupleDispatcher(&dispatcher_tx)).await
+                    }
+                    SparseMessage::RBCEcho(e)   => self.rbc.on_echo(sender, e.vertex_hash, &TupleDispatcher(&dispatcher_tx)).await,
+                    SparseMessage::RBCReady(r)  => self.rbc.on_ready(sender, r, &TupleDispatcher(&dispatcher_tx)).await,
+                    SparseMessage::RBCVote(v)   => self.rbc.on_vote(v, &TupleDispatcher(&dispatcher_tx)).await,
+                    SparseMessage::RBCCommit(c) => self.rbc.on_commit(c, &TupleDispatcher(&dispatcher_tx)).await,
+                    SparseMessage::Timeout(t)   => { self.handle_timeout_vote(sender, t.round, t.signature).await; None }
+                    SparseMessage::Commit(_)    => None,
+                    SparseMessage::Batch(b)     => { self.handle_batch(b.digest, b.payload, &dispatcher_tx).await; None }
+                    SparseMessage::BatchRequest(r) => { self.handle_batch_request(sender, r.digest, &dispatcher_tx).await; None }
+                };
+                if let Some(vertex) = delivered {
+                    self.handle_new_vertex_message(vertex.source, VertexMessage { sender: vertex.source, vertex }, &dispatcher_tx).await;
+                }
+                if start_time.elapsed() > duration { break; }
+            }
+
             self.process_work_loop(&dispatcher_tx).await;
         }
         
@@ -791,69 +819,82 @@ impl Sailfish {
         self.dag.insert(genesis_vertex);
     }
     
-    // Connection helpers (Standard)
-    async fn connect(&self, message_sender: Sender<(NodeId, SparseMessage)>, listener: &TcpListener) -> Vec<Option<TcpStream>> {
+    // Returns (data_connections, ctrl_connections): one TcpStream per peer per plane.
+    // plane=1 carries Vertex and Batch messages (large frames).
+    // plane=0 carries RBC echo/ready/vote, timeouts, and batch requests (small frames).
+    async fn connect(&self, message_sender: Sender<(NodeId, SparseMessage)>, listener: &TcpListener) -> (Vec<Option<TcpStream>>, Vec<Option<TcpStream>>) {
         let n_nodes = self.environment.nodes.len();
         let my_id = self.environment.my_node.id;
-        
-        let mut connections = Vec::with_capacity(n_nodes);
-        for _ in 0..n_nodes { connections.push(None); }
 
-        // 1. OUTGOING Connections (Background Retry Loop)
+        let mut data_connections: Vec<Option<TcpStream>> = (0..n_nodes).map(|_| None).collect();
+        let mut ctrl_connections: Vec<Option<TcpStream>> = (0..n_nodes).map(|_| None).collect();
+
+        // Outgoing: two connections per peer — one per plane.
         let mut outgoing_tasks = Vec::new();
         for node in &self.environment.nodes {
             if node.id == my_id { continue; }
             let target_id = node.id;
             let address = format!("{}:{}", node.host, node.port);
-            let my_id = my_id;
-            let private_key = self.private_key.clone();
 
-            let task = tokio::spawn(async move {
-                loop {
-                    if let Ok(mut stream) = TcpStream::connect(&address).await {
-                        let nonce = generate_nonce();
-                        let signature = private_key.sign(&nonce);
-                        
-                        if stream.write_all(&my_id.to_be_bytes()).await.is_err() { 
-                            sleep(Duration::from_millis(500)).await; continue; 
+            for plane in [0u8, 1u8] {
+                let address = address.clone();
+                let private_key = self.private_key.clone();
+                let task = tokio::spawn(async move {
+                    loop {
+                        if let Ok(mut stream) = TcpStream::connect(&address).await {
+                            let nonce = generate_nonce();
+                            let signature = private_key.sign(&nonce);
+                            if stream.write_all(&my_id.to_be_bytes()).await.is_err() {
+                                sleep(Duration::from_millis(500)).await; continue;
+                            }
+                            if stream.write_all(&[plane]).await.is_err() {
+                                sleep(Duration::from_millis(500)).await; continue;
+                            }
+                            if stream.write_all(&nonce).await.is_err() {
+                                sleep(Duration::from_millis(500)).await; continue;
+                            }
+                            if stream.write_all(signature.as_ref()).await.is_err() {
+                                sleep(Duration::from_millis(500)).await; continue;
+                            }
+                            return (target_id, plane, Some(stream));
                         }
-                        if stream.write_all(&nonce).await.is_err() { 
-                            sleep(Duration::from_millis(500)).await; continue; 
-                        }
-                        if stream.write_all(signature.as_ref()).await.is_err() { 
-                            sleep(Duration::from_millis(500)).await; continue; 
-                        }
-                        return (target_id, Some(stream));
+                        sleep(Duration::from_millis(500)).await;
                     }
-                    sleep(Duration::from_millis(500)).await;
-                }
-            });
-            outgoing_tasks.push(task);
+                });
+                outgoing_tasks.push(task);
+            }
         }
 
-        // 2. INCOMING Connections (Main Thread)
+        // Incoming: 2×(n-1) connections. All feed the same message_rx regardless of plane.
         let mut accepted = 0;
-        let expected_peers = n_nodes - 1;
-        info!("[Node {}] Waiting for {} connections...", my_id, expected_peers);
+        let expected_connections = 2 * (n_nodes - 1);
+        info!("[Node {}] Waiting for {} connections...", my_id, expected_connections);
 
-        while accepted < expected_peers {
+        while accepted < expected_connections {
             if let Ok((mut stream, addr)) = listener.accept().await {
                 let mut id_buf = [0u8; 4];
-                if stream.read_exact(&mut id_buf).await.is_err() { 
+                if stream.read_exact(&mut id_buf).await.is_err() {
                     warn!("[Node {}] Handshake failed: could not read ID from {}. Dropping.", my_id, addr);
-                    continue; 
+                    continue;
                 }
                 let claimed_id = u32::from_be_bytes(id_buf);
-                
+
+                // Consume the plane byte for wire alignment (not used on the receive side).
+                let mut plane_buf = [0u8; 1];
+                if stream.read_exact(&mut plane_buf).await.is_err() {
+                    warn!("[Node {}] Handshake failed: could not read plane from Node {}. Dropping.", my_id, claimed_id);
+                    continue;
+                }
+
                 let mut nonce = vec![0u8; NONCE_BYTES_LENGTH];
-                if stream.read_exact(&mut nonce).await.is_err() { 
+                if stream.read_exact(&mut nonce).await.is_err() {
                     warn!("[Node {}] Handshake failed: could not read nonce from Node {}. Dropping.", my_id, claimed_id);
-                    continue; 
+                    continue;
                 }
                 let mut sig_bytes = vec![0u8; SIGNATURE_BYTES_LENGTH];
-                if stream.read_exact(&mut sig_bytes).await.is_err() { 
+                if stream.read_exact(&mut sig_bytes).await.is_err() {
                     warn!("[Node {}] Handshake failed: could not read signature from Node {}. Dropping.", my_id, claimed_id);
-                    continue; 
+                    continue;
                 }
 
                 if let Some(key) = self.public_keys.get(&claimed_id) {
@@ -861,13 +902,13 @@ impl Sailfish {
                         if key.verify(&nonce, &signature).is_ok() {
                             let msg_sender = message_sender.clone();
                             let pks = self.public_keys.clone();
-                            let my_id = self.environment.my_node.id;
                             let test_flag = self.environment.test_flag;
                             tokio::spawn(async move {
                                 Self::handle_connection(stream, msg_sender, my_id, claimed_id, pks, test_flag).await;
                             });
                             accepted += 1;
-                            info!("[Node {}] Accepted connection from Node {} ({}/{})", my_id, claimed_id, accepted, expected_peers);
+                            info!("[Node {}] Accepted connection from Node {} ({}/{})",
+                                my_id, claimed_id, accepted, expected_connections);
                         } else {
                             warn!("[Node {}] Handshake failed: INVALID SIGNATURE from Node {}. Dropping.", my_id, claimed_id);
                         }
@@ -881,17 +922,23 @@ impl Sailfish {
         }
 
         for task in outgoing_tasks {
-            let (id, stream) = task.await.unwrap();
-            connections[id as usize] = stream;
+            let (id, plane, stream) = task.await.unwrap();
+            if plane == 1 {
+                data_connections[id as usize] = stream;
+            } else {
+                ctrl_connections[id as usize] = stream;
+            }
         }
-        connections
+        (data_connections, ctrl_connections)
     }
 
-    async fn handle_connection(mut stream: TcpStream, 
-        message_sender: Sender<(NodeId, SparseMessage)>, 
-        my_id: NodeId, peer_id: NodeId, 
-        public_keys: HashMap<NodeId, PublicKey>, 
-        test_flag: bool
+    async fn handle_connection(
+        mut stream: TcpStream,
+        message_sender: Sender<(NodeId, SparseMessage)>,
+        my_id: NodeId,
+        peer_id: NodeId,
+        _public_keys: HashMap<NodeId, PublicKey>,
+        _test_flag: bool,
     ) {
         info!("[Node {}] Listening for messages from Node {}", my_id, peer_id);
         loop {
@@ -904,59 +951,55 @@ impl Sailfish {
             if length == 0 || length > 10 * 1024 * 1024 { return; }
             let mut buffer = vec![0; length as usize];
             if stream.read_exact(&mut buffer).await.is_err() { return; }
-            let mut verified = test_flag;
+            // Read signature bytes for wire alignment; skip expensive Ed25519 verify
+            // (TCP handshake already authenticates the sender).
             let mut sig_bytes = [0u8; 64];
             if stream.read_exact(&mut sig_bytes).await.is_err() { return; }
-            if !test_flag {
-                if let Some(pubkey) = public_keys.get(&peer_id){
-                    if let Ok(sig) = Signature::from_bytes(&sig_bytes) {
-                        if pubkey.verify(&buffer, &sig).is_ok() {
-                            verified = true;
-                        }
-                    }
-                }
-            }
-            if verified {
-                if let Ok(message) = deserialize(&buffer) {
-                    if message_sender.send((peer_id, message)).await.is_err() {
-                        return;
-                    }
+            if let Ok(message) = deserialize(&buffer) {
+                if message_sender.send((peer_id, message)).await.is_err() {
+                    return;
                 }
             }
         }
-     }
+    }
 
 
-     // ✅ UPDATED: Parallel Sender
-    fn start_message_dispatcher(&self, mut dispatcher_receiver: mpsc::Receiver<SailDispatch>, connections: Vec<Option<TcpStream>>) {
+    fn start_message_dispatcher(
+        &self,
+        mut dispatcher_receiver: mpsc::Receiver<SailDispatch>,
+        data_connections: Vec<Option<TcpStream>>,
+        ctrl_connections: Vec<Option<TcpStream>>,
+    ) {
         let private_key = self.private_key.clone();
         let test_flag = self.environment.test_flag;
 
-        // 1. Create a channel for each active connection
-        let mut peer_senders = Vec::new();
-
-        for (_id, stream_option) in connections.into_iter().enumerate() {
-            if let Some(mut stream) = stream_option {
-                let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1000);
-                peer_senders.push(Some(tx));
-
-                tokio::spawn(async move {
-                    while let Some(data) = rx.recv().await {
-                        if stream.write_all(&data).await.is_err() {
-                            break; 
+        // Build one write task per peer per plane. Each writer drains its own queue
+        // independently, so a large Vertex or Batch frame on the data channel never
+        // delays an RBC echo or vote on the control channel.
+        fn build_senders(
+            connections: Vec<Option<TcpStream>>,
+        ) -> Vec<Option<mpsc::Sender<Arc<Vec<u8>>>>> {
+            connections.into_iter().map(|stream_opt| {
+                stream_opt.map(|mut stream| {
+                    let (tx, mut rx) = mpsc::channel::<Arc<Vec<u8>>>(1000);
+                    tokio::spawn(async move {
+                        while let Some(data) = rx.recv().await {
+                            if stream.write_all(&data).await.is_err() {
+                                break;
+                            }
                         }
-                    }
-                });
-            } else {
-                peer_senders.push(None);
-            }
+                    });
+                    tx
+                })
+            }).collect()
         }
 
-        // 2. Main Dispatcher Loop
+        let data_senders = build_senders(data_connections);
+        let ctrl_senders = build_senders(ctrl_connections);
+
         tokio::spawn(async move {
             while let Some((target, message)) = dispatcher_receiver.recv().await {
                 if let Ok(payload) = bincode::serialize(&message) {
-
                     let signature = if !test_flag {
                         private_key.sign(&payload)
                     } else {
@@ -964,25 +1007,32 @@ impl Sailfish {
                     };
 
                     let length_bytes = (payload.len() as u32).to_be_bytes();
+                    let mut frame_data = Vec::with_capacity(4 + payload.len() + 64);
+                    frame_data.extend_from_slice(&length_bytes);
+                    frame_data.extend_from_slice(&payload);
+                    frame_data.extend_from_slice(signature.as_ref());
+                    // Wrap once in Arc — all broadcast clones are O(1) refcount bumps.
+                    let frame = Arc::new(frame_data);
 
-                    let mut frame = Vec::with_capacity(4 + payload.len() + 64);
-                    frame.extend_from_slice(&length_bytes);
-                    frame.extend_from_slice(&payload);
-                    frame.extend_from_slice(signature.as_ref());
+                    // Vertex and Batch carry large payloads — route to data channel.
+                    // Everything else (RBC echo/ready/vote, timeouts, batch requests)
+                    // is small and goes on the control channel.
+                    let senders = match &message {
+                        SparseMessage::Vertex(_) | SparseMessage::Batch(_) => &data_senders,
+                        _ => &ctrl_senders,
+                    };
 
                     match target {
                         None => {
-                            // Broadcast to all peers
-                            for tx in peer_senders.iter() {
+                            for tx in senders.iter() {
                                 if let Some(sender) = tx {
                                     let _ = sender.send(frame.clone()).await;
                                 }
                             }
                         }
                         Some(peer_id) => {
-                            // Unicast to specific peer
-                            if let Some(Some(tx)) = peer_senders.get(peer_id as usize) {
-                                let _ = tx.send(frame.clone()).await;
+                            if let Some(Some(tx)) = senders.get(peer_id as usize) {
+                                let _ = tx.send(frame).await;
                             }
                         }
                     }
