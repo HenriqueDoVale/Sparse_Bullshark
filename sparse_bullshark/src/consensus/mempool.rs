@@ -94,6 +94,11 @@ impl BatchStore {
     pub fn tx_count(&self, digest: &[u8]) -> usize {
         self.inner.lock().unwrap().get(digest).map(|(_, c)| *c).unwrap_or(0)
     }
+    /// Drop a batch once it is no longer needed (its vertex has been committed
+    /// and pruned). Bounds memory — without this the store grows unbounded.
+    pub fn remove(&self, digest: &[u8]) -> bool {
+        self.inner.lock().unwrap().remove(digest).is_some()
+    }
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().len()
     }

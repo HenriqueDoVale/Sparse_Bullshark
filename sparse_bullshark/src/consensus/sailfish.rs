@@ -28,9 +28,10 @@ const MESSAGE_CHANNEL_SIZE: usize = 1024;
 const SOCKET_BINDING_DELAY: u64 = 2;
 const MESSAGE_BYTES_LENGTH: usize = 4;
 const EXECUTION_DURATION: u64 = 60;
+
 // Number of parallel mempool workers in `workers` mode. Change this value to
 // tune the worker parallelism (compile-time constant, like PRBC_C in PRBC).
-const NUM_WORKERS: usize = 8;
+const NUM_WORKERS: usize = 2;
 
 // Dispatcher channel: None = broadcast to all; Some(id) = unicast to that peer.
 type SailDispatch = (Option<NodeId>, SparseMessage);
@@ -90,7 +91,24 @@ pub struct Sailfish {
     ack_sender: Option<Sender<(BatchDigest, NodeId)>>,
     // Exact count of committed transactions (batches have variable size in
     // workers mode, so we cannot use finalized_block_count * n_tx).
+
     committed_tx_count: usize,
+
+    // Rounds a batch stays pullable after the DAG has moved past it. Kept
+    // separate from the 4-round DAG prune on purpose: the DAG may forget an
+    // ordered vertex at once, but a batch must stay servable to peers still
+    // catching up (`handle_batch_request`), or they block forever on a vertex
+    // they can never complete. 0 disables batch eviction.
+    batch_gc_window: u64,
+    evicted_batches: usize,
+
+    // --- Throughput time series ---
+    // A single 60 s average hides bursts, stalls and warm-up. We emit one
+    // THROUGHPUT line per second so the shape of the throughput over time can
+    // be plotted and checked for steadiness.
+    run_start: Option<Instant>,
+    last_sample_at: Option<Instant>,
+    last_sample_tx: usize,
 }
 
 impl Sailfish {
@@ -137,6 +155,7 @@ impl Sailfish {
             committed_vertex_count: 0,
 
             round_timeout_ms: std::env::var("ROUND_TIMEOUT_MS")
+
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
 
             mempool_mode: MempoolMode::from_env(),
@@ -146,6 +165,14 @@ impl Sailfish {
             certified_receiver: None,
             ack_sender: None,
             committed_tx_count: 0,
+
+            batch_gc_window: std::env::var("BATCH_GC_ROUNDS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(20),
+            evicted_batches: 0,
+
+            run_start: None,
+            last_sample_at: None,
+            last_sample_tx: 0,
         };
         node.add_genesis_block();
         node
@@ -501,7 +528,7 @@ impl Sailfish {
 
                                 self.finalized_block_count += committed_count;
                                 self.last_ordered_round = r;
-                                self.dag.prune(self.last_ordered_round.saturating_sub(4));
+                                self.prune_dag_and_batches();
                             }
                         } else {
                             // Not enough votes yet. Check if more can still arrive.
@@ -514,7 +541,7 @@ impl Sailfish {
                                 warn!("[Node {}] Skipping stuck leader at round {} (leader={}, votes={}/{}, r+1 DAG={}/{})",
                                     self.environment.my_node.id, r, leader_id, votes, 2 * self.f + 1, r1_size, n);
                                 self.last_ordered_round = r;
-                                self.dag.prune(self.last_ordered_round.saturating_sub(4));
+                                self.prune_dag_and_batches();
                                 // continue to next round
                             } else {
                                 break; // More votes may still arrive
@@ -571,8 +598,85 @@ impl Sailfish {
         count
     }
 
+    /// Total transactions committed so far, whatever the mempool mode.
+    /// Inline: every committed vertex carries exactly n_tx transactions.
+    /// Digest modes: batches vary in size, so the exact count is accumulated.
+    fn total_committed_tx(&self) -> usize {
+        match self.mempool_mode {
+            MempoolMode::Inline => self.finalized_block_count * self.environment.n_transactions,
+            _ => self.committed_tx_count,
+        }
+    }
+
+    /// Emit one THROUGHPUT sample per second on stdout. Called from the main
+    /// event loop (which ticks at least every 50 ms). The samples let us plot
+    /// throughput over time and tell a steady run from a bursty one — the
+    /// single end-of-run average cannot show that.
+    fn maybe_emit_throughput_sample(&mut self) {
+        const SAMPLE_INTERVAL_MS: u128 = 1000;
+
+        let (run_start, last_at) = match (self.run_start, self.last_sample_at) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return,
+        };
+        let window = last_at.elapsed();
+        if window.as_millis() < SAMPLE_INTERVAL_MS {
+            return;
+        }
+
+        let total = self.total_committed_tx();
+        let delta = total.saturating_sub(self.last_sample_tx);
+        let tps = delta as f64 / window.as_secs_f64();
+
+        // Space-separated key=value so it is trivial to grep/parse and cannot be
+        // confused with the CONFIG/RESULTS block printed at the end of the run.
+        println!(
+            "THROUGHPUT node={} t={:.1} tps={:.0} tx={} total={} rounds={} batches={}",
+            self.environment.my_node.id,
+            run_start.elapsed().as_secs_f64(),
+            tps,
+            delta,
+            total,
+            self.last_ordered_round,
+            self.batch_store.len(),
+        );
+
+        self.last_sample_at = Some(Instant::now());
+        self.last_sample_tx = total;
+    }
+
+    /// Prune committed rounds from the DAG and, in digest modes, drop the
+    /// corresponding batches from the store so memory stays bounded. Without
+    /// this the store grows unbounded and the process eventually OOMs.
+    /// Prune ordered rounds from the DAG and, in digest modes, drop the batches
+    /// they referenced so memory stops growing with the run's duration.
+    ///
+    /// Both use the same cutoff, and the batch window is what drives it. A
+    /// vertex has to survive long enough for its digests to be identified and
+    /// freed: pruning the DAG faster than the batch window would leave those
+    /// batches unreachable, and therefore permanent. Vertices only carry digest
+    /// lists in these modes, so holding them longer costs almost nothing.
+    fn prune_dag_and_batches(&mut self) {
+        let evicting = self.mempool_mode.uses_digests() && self.batch_gc_window > 0;
+        let window = if evicting { self.batch_gc_window.max(4) } else { 4 };
+        let cutoff = self.last_ordered_round.saturating_sub(window);
+
+        if evicting {
+            let stale: Vec<BatchDigest> = self.dag.vertices.values()
+                .filter(|v| v.round < cutoff)
+                .flat_map(|v| decode_digests(&v.block))
+                .collect();
+            for d in stale {
+                if self.batch_store.remove(&d) {
+                    self.evicted_batches += 1;
+                }
+            }
+        }
+
+        self.dag.prune(cutoff);
+    }
     // --- STANDARD BOILERPLATE (Network & RBC) ---
-    
+
     /// Produce the `block` field for a new vertex, per mempool mode.
     async fn next_batch(&mut self, dispatcher_tx: &Sender<SailDispatch>) -> Vec<u8> {
         match self.mempool_mode {
@@ -749,6 +853,10 @@ impl Sailfish {
         let start_time = Instant::now();
         let duration = Duration::from_secs(EXECUTION_DURATION);
 
+        // Start the throughput time series at the same instant as the run.
+        self.run_start = Some(start_time);
+        self.last_sample_at = Some(start_time);
+
         // Initial Kick
         self.process_work_loop(&dispatcher_tx).await;
 
@@ -785,8 +893,9 @@ impl Sailfish {
             }
             
             self.process_work_loop(&dispatcher_tx).await;
+            self.maybe_emit_throughput_sample();
         }
-        
+
         self.print_dag_stats();
         std::process::exit(0);
     }
@@ -885,8 +994,6 @@ impl Sailfish {
             ).await;
         }
     }
-
-
 
     async fn unicast(&self, target: NodeId, msg: SparseMessage, dispatcher_tx: &Sender<SailDispatch>){
         if let Err(_) = dispatcher_tx.send((Some(target), msg)).await{
@@ -1045,7 +1152,6 @@ impl Sailfish {
         }
      }
 
-
      // ✅ UPDATED: Parallel Sender
     fn start_message_dispatcher(&self, mut dispatcher_receiver: mpsc::Receiver<SailDispatch>, connections: Vec<Option<TcpStream>>) {
         let private_key = self.private_key.clone();
@@ -1120,12 +1226,7 @@ impl Sailfish {
         let n_tx       = self.environment.n_transactions;
         let exec_secs  = EXECUTION_DURATION as f64;
 
-        // Inline: every committed vertex carries n_tx transactions. Decoupled /
-        // workers: batches have variable size, so use the exact committed count.
-        let total_tx    = match self.mempool_mode {
-            MempoolMode::Inline => self.finalized_block_count * n_tx,
-            _ => self.committed_tx_count,
-        };
+        let total_tx    = self.total_committed_tx();
         let total_bytes = total_tx * tx_size;
         let tps         = total_tx as f64 / exec_secs;
         let bps         = total_bytes as f64 / exec_secs;
@@ -1167,6 +1268,8 @@ impl Sailfish {
         println!("  Consensus latency:    {:.1} ms", avg_latency_ms);
         if self.mempool_mode.uses_digests() {
             println!("  Batches cached:       {}", self.batch_store.len());
+            println!("  Batches evicted:      {} (window {} rounds)",
+                     self.evicted_batches, self.batch_gc_window);
         }
     }
 }
