@@ -24,7 +24,7 @@ from collections import defaultdict
 # ── Cluster config ─────────────────────────────────────────────────────────────
 
 KEYS_FILE  = "./keys"
-NODES_CSV  = "./shared/nodes_distributed.csv"
+NODES_CSV  = "./shared/nodes_distributed{suffix}.csv"   # {suffix} filled in by --n-nodes
 WORK_DIR   = "~/Sparse_Bullshark"
 BINARY     = "./target/release/sparse_bullshark"
 SSH_USER   = "henriquecostavale"
@@ -33,11 +33,19 @@ SSH_OPTS   = ["-i", SSH_KEY, "-o", "StrictHostKeyChecking=no", "-o", "LogLevel=E
 
 # ── File readers ───────────────────────────────────────────────────────────────
 
-def read_nodes():
+def nodes_csv_path(n_nodes: int | None) -> str:
+    suffix = f"_{n_nodes}" if n_nodes is not None else ""
+    return NODES_CSV.format(suffix=suffix)
+
+
+def read_nodes(n_nodes: int | None):
+    path = nodes_csv_path(n_nodes)
     nodes = []
-    with open(NODES_CSV, newline="") as f:
+    with open(path, newline="") as f:
         for row in csv.DictReader(f):
             nodes.append({"id": int(row["id"]), "host": row["host"].strip()})
+    if n_nodes is not None and len(nodes) != n_nodes:
+        print(f"Warning: {path} has {len(nodes)} nodes but --n-nodes={n_nodes}.", file=sys.stderr)
     return nodes
 
 
@@ -61,7 +69,7 @@ def group_by_host(nodes):
 
 # ── Remote script builder ──────────────────────────────────────────────────────
 
-def build_remote_script(node_ids, priv_keys, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, reduced_quorum):
+def build_remote_script(node_ids, priv_keys, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, reduced_quorum, decoupled):
     """Build a bash script that runs all assigned nodes on one machine."""
     lines = [
         "#!/bin/bash",
@@ -77,6 +85,8 @@ def build_remote_script(node_ids, priv_keys, tx_size, n_tx, mode, input_rate, rb
         lines.append("export PRBC_SIGS=off")
     if mode == "prbc_sailfish" and reduced_quorum:
         lines.append("export REDUCED_QUORUM=on")
+    if decoupled:
+        lines.append("export MEMPOOL_MODE=decoupled")
 
     for nid in node_ids:
         # Single-quote the key: base64 chars never contain single quotes
@@ -203,17 +213,22 @@ async def main():
     parser.add_argument("--tx-size",      type=int, required=True, help="Transaction size in bytes")
     parser.add_argument("--n-tx",         type=int, required=True, help="Transactions per block")
     parser.add_argument("--mode",         choices=["sailfish", "prbc_sailfish"], default="prbc_sailfish")
+    parser.add_argument("--n-nodes",      type=int, default=None,
+                        help="Node count; selects nodes_distributed_N.csv on the cluster "
+                             "(omit to use nodes_distributed.csv)")
     parser.add_argument("--input-rate",   type=int, default=0, help="Aggregate tx/s (0 = unlimited)")
     parser.add_argument("--rbc",          choices=["bracha", "signed_vote"], default="bracha",
                         help="RBC variant for sailfish mode")
     parser.add_argument("--no-prbc-sigs", action="store_true")
     parser.add_argument("--reduced-quorum", action="store_true",
                         help="Use f+1 quorum instead of 2f+1 (CFT threshold, not BFT-safe)")
+    parser.add_argument("--decoupled",    action="store_true",
+                        help="Enable MEMPOOL_MODE=decoupled (Narwhal-style batch store)")
     parser.add_argument("--logs",         action="store_true", help="Print stderr from each machine")
     args = parser.parse_args()
 
     # Load cluster topology
-    nodes     = read_nodes()
+    nodes     = read_nodes(args.n_nodes)
     priv_keys = read_private_keys()
     groups    = group_by_host(nodes)   # {ip: [node_ids]}
 
@@ -225,9 +240,10 @@ async def main():
     print("--------------------------------------------------")
     print(" STARTING DISTRIBUTED EXPERIMENT")
     print("--------------------------------------------------")
-    rbc_suffix = f" [{args.rbc}]" if args.mode == "sailfish" else ""
-    quorum_suffix = " [quorum: f+1]" if (args.mode == "prbc_sailfish" and args.reduced_quorum) else ""
-    print(f"  Protocol:   {args.mode.replace('_', '-').upper()}{rbc_suffix}{quorum_suffix}")
+    rbc_suffix     = f" [{args.rbc}]" if args.mode == "sailfish" else ""
+    quorum_suffix  = " [quorum: f+1]" if (args.mode == "prbc_sailfish" and args.reduced_quorum) else ""
+    mempool_suffix = " [decoupled]" if args.decoupled else ""
+    print(f"  Protocol:   {args.mode.replace('_', '-').upper()}{rbc_suffix}{quorum_suffix}{mempool_suffix}")
     print(f"  Tx size:    {args.tx_size} B")
     print(f"  Tx/block:   {args.n_tx}")
     print(f"  Nodes:      {len(nodes)}")
@@ -246,6 +262,7 @@ async def main():
         script = build_remote_script(
             node_ids, priv_keys, args.tx_size, args.n_tx,
             args.mode, args.input_rate, args.rbc, args.no_prbc_sigs, args.reduced_quorum,
+            args.decoupled,
         )
         machine_order.append((ip, node_ids))
         tasks.append(asyncio.create_task(run_on_machine(ip, script, timeout_secs)))
