@@ -24,7 +24,7 @@ from collections import defaultdict
 # ── Cluster config ─────────────────────────────────────────────────────────────
 
 KEYS_FILE  = "./keys"
-NODES_CSV  = "./shared/nodes_distributed{suffix}.csv"   # {suffix} filled in by --n-nodes
+NODES_CSV  = "./shared/nodes_distributed.csv"
 WORK_DIR   = "~/Sparse_Bullshark"
 BINARY     = "./target/release/sparse_bullshark"
 SSH_USER   = "henriquecostavale"
@@ -33,20 +33,20 @@ SSH_OPTS   = ["-i", SSH_KEY, "-o", "StrictHostKeyChecking=no", "-o", "LogLevel=E
 
 # ── File readers ───────────────────────────────────────────────────────────────
 
-def nodes_csv_path(n_nodes: int | None) -> str:
-    suffix = f"_{n_nodes}" if n_nodes is not None else ""
-    return NODES_CSV.format(suffix=suffix)
-
-
 def read_nodes(n_nodes: int | None):
-    path = nodes_csv_path(n_nodes)
-    nodes = []
-    with open(path, newline="") as f:
+    """Read all rows from nodes_distributed.csv, truncating to n_nodes if specified."""
+    rows = []
+    with open(NODES_CSV, newline="") as f:
         for row in csv.DictReader(f):
-            nodes.append({"id": int(row["id"]), "host": row["host"].strip()})
-    if n_nodes is not None and len(nodes) != n_nodes:
-        print(f"Warning: {path} has {len(nodes)} nodes but --n-nodes={n_nodes}.", file=sys.stderr)
-    return nodes
+            rows.append({
+                "id":       int(row["id"]),
+                "host":     row["host"].strip(),
+                "port":     row.get("port", "").strip(),
+                "behavior": row.get("behavior", "ok").strip(),
+            })
+    if n_nodes is not None:
+        rows = rows[:n_nodes]
+    return rows
 
 
 def read_private_keys():
@@ -69,11 +69,19 @@ def group_by_host(nodes):
 
 # ── Remote script builder ──────────────────────────────────────────────────────
 
-def build_remote_script(node_ids, priv_keys, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, reduced_quorum, decoupled):
+def build_remote_script(node_ids, all_nodes, priv_keys, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, reduced_quorum, decoupled):
     """Build a bash script that runs all assigned nodes on one machine."""
+    # Build the CSV content for the active subset of nodes so the binary sees
+    # only the N nodes participating in this run (not the full 50-node file).
+    csv_lines = ["id,host,port,behavior"]
+    for n in all_nodes:
+        csv_lines.append(f"{n['id']},{n['host']},{n['port']},{n['behavior']}")
+    csv_content = "\\n".join(csv_lines)
+
     lines = [
         "#!/bin/bash",
         f"cd {WORK_DIR}",
+        f"printf '{csv_content}\\n' > shared/nodes_distributed.csv",
         f"export PROTOCOL={mode}",
         "export RUST_LOG=warn",
     ]
@@ -260,7 +268,7 @@ async def main():
     tasks = []
     for ip, node_ids in groups.items():
         script = build_remote_script(
-            node_ids, priv_keys, args.tx_size, args.n_tx,
+            node_ids, nodes, priv_keys, args.tx_size, args.n_tx,
             args.mode, args.input_rate, args.rbc, args.no_prbc_sigs, args.reduced_quorum,
             args.decoupled,
         )
