@@ -21,18 +21,126 @@ impl PRBCDag {
         self.rounds.entry(vertex.round).or_default().push(h.clone());
         self.vertices.insert(h, vertex);
     }
-    pub fn prune(&mut self, before_round: u64) {
+
+    /// Replace a hash-only skeleton with the complete vertex without adding a
+    /// duplicate entry to the round index. If no skeleton exists, insert the
+    /// vertex normally.
+    pub fn replace_or_insert(&mut self, vertex: Vertex) {
+        let hash = vertex.hash.clone();
+        if let Some(existing) = self.vertices.get_mut(&hash) {
+            *existing = vertex;
+        } else {
+            self.insert(vertex);
+        }
+    }
+
+    /// Prune old vertices only after they have been ordered. Unordered old
+    /// vertices must remain available so a later weak edge can include them.
+    pub fn prune_ordered(
+        &mut self,
+        before_round: u64,
+        ordered: &HashSet<VertexHash>,
+    ) {
         let to_remove: Vec<u64> = self.rounds.keys()
             .filter(|&&r| r < before_round)
             .cloned()
             .collect();
         for r in to_remove {
             if let Some(hashes) = self.rounds.remove(&r) {
-                for h in hashes {
-                    self.vertices.remove(&h);
+                let mut retained = Vec::new();
+                for hash in hashes {
+                    if ordered.contains(&hash) {
+                        self.vertices.remove(&hash);
+                    } else {
+                        retained.push(hash);
+                    }
+                }
+                if !retained.is_empty() {
+                    self.rounds.insert(r, retained);
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod prbc_dag_tests {
+    use super::PRBCDag;
+    use crate::types::vertex::{TimeoutCertificate, Vertex};
+    use std::collections::{BTreeMap, HashSet};
+
+    #[test]
+    fn replacing_skeleton_preserves_all_hash_authenticated_fields() {
+        let mut signatures = BTreeMap::new();
+        signatures.insert(1, vec![7; 64]);
+
+        let mut full_vertex = Vertex {
+            hash: Vec::new(),
+            round: 2,
+            source: 1,
+            block: vec![3; 32],
+            edges: vec![vec![4; 32]],
+            weak_edges: vec![vec![5; 32]],
+            signed_round: vec![6],
+            sample_proof: vec![7],
+            tc: Some(TimeoutCertificate {
+                round: 1,
+                signatures,
+            }),
+            nvc: None,
+        };
+        full_vertex.hash = full_vertex.calculate_hash();
+
+        let skeleton = Vertex {
+            hash: full_vertex.hash.clone(),
+            round: full_vertex.round,
+            source: full_vertex.source,
+            block: Vec::new(),
+            edges: Vec::new(),
+            weak_edges: Vec::new(),
+            signed_round: Vec::new(),
+            sample_proof: Vec::new(),
+            tc: None,
+            nvc: None,
+        };
+
+        let mut dag = PRBCDag::new();
+        dag.insert(skeleton);
+        dag.replace_or_insert(full_vertex.clone());
+
+        let stored = dag.vertices.get(&full_vertex.hash).unwrap();
+        assert_eq!(stored, &full_vertex);
+        assert_eq!(stored.calculate_hash(), full_vertex.hash);
+        assert!(stored.tc.is_some());
+        assert_eq!(dag.rounds.get(&full_vertex.round).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pruning_keeps_unordered_vertices_for_future_weak_edges() {
+        let mut dag = PRBCDag::new();
+        let ordered = Vertex {
+            hash: vec![1; 32],
+            round: 1,
+            source: 1,
+            block: Vec::new(),
+            edges: Vec::new(),
+            weak_edges: Vec::new(),
+            signed_round: Vec::new(),
+            sample_proof: Vec::new(),
+            tc: None,
+            nvc: None,
+        };
+        let mut unordered = ordered.clone();
+        unordered.hash = vec![2; 32];
+        unordered.source = 2;
+
+        dag.insert(ordered.clone());
+        dag.insert(unordered.clone());
+        dag.prune_ordered(2, &HashSet::from([ordered.hash.clone()]));
+
+        assert!(!dag.vertices.contains_key(&ordered.hash));
+        assert_eq!(dag.vertices.get(&unordered.hash), Some(&unordered));
+        assert_eq!(dag.rounds.get(&1), Some(&vec![unordered.hash]));
     }
 }
 

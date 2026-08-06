@@ -155,7 +155,8 @@ def print_summary(config, results, n_nodes):
 
 # ── Node runner ───────────────────────────────────────────────────────────────
 
-async def run_node(node_id, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, reduced_quorum, timeout_ms, mempool, private_key,
+async def run_node(node_id, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, reduced_quorum, timeout_ms, mempool,
+                   network_mbps, consensus_network_percent, private_key,
                    stdout_buf, stderr_buf, procs):
     env = os.environ.copy()
     env[f"PRIVATE_KEY_{node_id}"] = private_key
@@ -163,6 +164,9 @@ async def run_node(node_id, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, 
     env["RUST_LOG"] = "warn"
     if input_rate > 0:
         env["INPUT_RATE"] = str(input_rate)
+    if network_mbps is not None:
+        env["NETWORK_MBPS"] = str(network_mbps)
+        env["CONSENSUS_NETWORK_PERCENT"] = str(consensus_network_percent)
     if mode == "sailfish":
         env["RBC_MODE"] = rbc
         # Narwhal-style decoupled mempool (Sailfish only): vertices carry batch
@@ -216,6 +220,10 @@ async def main():
                         help="sailfish = Sailfish (Standard RBC), prbc_sailfish = PRBC-Sailfish")
     parser.add_argument("--input-rate", type=int, default=0,
                         help="Input rate in tx/s (0 = unlimited)")
+    parser.add_argument("--network-mbps", type=float,
+                        help="Per-node outbound network budget in Mbps; omitted disables shaping")
+    parser.add_argument("--consensus-network-percent", type=float, default=20.0,
+                        help="Network headroom reserved for consensus when --network-mbps is set (default: 20)")
     parser.add_argument("--rbc", choices=["bracha", "signed_vote"], default="signed_vote",
                         help="RBC variant for Sailfish (bracha or signed_vote; ignored for prbc_sailfish)")
     parser.add_argument("--no-prbc-sigs", action="store_true",
@@ -230,6 +238,11 @@ async def main():
     parser.add_argument("--logs", action="store_true",
                         help="Print captured stderr (warn/error logs) from each node after results")
     args = parser.parse_args()
+
+    if args.network_mbps is not None and args.network_mbps <= 0:
+        parser.error("--network-mbps must be greater than 0")
+    if not 0 <= args.consensus_network_percent < 100:
+        parser.error("--consensus-network-percent must be in [0, 100)")
 
     for path in [KEYS_FILE, NODES_CSV]:
         if not os.path.exists(path):
@@ -265,6 +278,9 @@ async def main():
     print(f"  Tx/block:   {args.n_tx}")
     print(f"  Nodes:      {len(nodes)}")
     print(f"  Input rate: {'unlimited' if args.input_rate == 0 else str(args.input_rate) + ' tx/s'}")
+    if args.network_mbps is not None:
+        print(f"  Network:    {args.network_mbps:g} Mbps/node, "
+              f"{args.consensus_network_percent:g}% reserved for consensus")
     print(f"  Timeout:    {args.timeout} ms")
     print("--------------------------------------------------")
     print("Running... (output suppressed, results printed on completion)")
@@ -277,7 +293,8 @@ async def main():
         asyncio.create_task(
             run_node(
                 n["id"], args.tx_size, args.n_tx, args.mode,
-                args.input_rate, args.rbc, args.no_prbc_sigs, args.reduced_quorum, args.timeout, args.mempool, priv_keys[n["id"]],
+                args.input_rate, args.rbc, args.no_prbc_sigs, args.reduced_quorum, args.timeout, args.mempool,
+                args.network_mbps, args.consensus_network_percent, priv_keys[n["id"]],
                 stdout_bufs[i], stderr_bufs[i], procs
             )
         )

@@ -85,7 +85,6 @@ pub fn get_public_keys() -> HashMap<u32, PublicKey> {
 
 pub fn get_private_key(node_id: u32) -> Keypair {
     let encoded_key = env::var(format!("{}{}", PRIVATE_KEY_ENV, node_id)).expect("Private key environment variable is not set");
-    println!("{}",encoded_key.to_string());
     let key_data = general_purpose::STANDARD.decode(encoded_key).expect("Failed to decode base64 private key");
     Keypair::from_bytes(&key_data).expect("Failed to parse private key")
 }

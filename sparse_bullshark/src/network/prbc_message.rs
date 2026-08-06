@@ -3,6 +3,14 @@ use serde::{Deserialize, Serialize};
 use crate::types::vertex::{NodeId, Vertex, VertexHash};
 use crate::network::message::TimeoutMessage;
 
+/// A serialized transaction batch disseminated independently of its vertex.
+/// Its digest alone determines the batch's S1 and per-member S2 relay sets.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PRBCBatchMessage {
+    pub digest: VertexHash,
+    pub payload: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PRBCProposeMessage {
     pub vertex: Vertex,
@@ -38,6 +46,9 @@ pub struct PRBCRecoveryRespMessage {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum PRBCMessage {
+    /// Best-effort dissemination of a serialized transaction batch. Vertices
+    /// refer to this payload only by `digest`.
+    Batch(PRBCBatchMessage),
     PRBCPropose(PRBCProposeMessage),
     PRBCVote(PRBCVoteMessage),
     PRBCRecovery(PRBCRecoveryMessage),
