@@ -114,8 +114,8 @@ def build_remote_script(node_ids, all_nodes, priv_keys, tx_size, n_tx, mode, inp
     lines += [
         "",
         "# Kill any leftover processes from a previous run",
-        "pkill -f sparse_bullshark 2>/dev/null || true",
-        "sleep 1",
+        "pkill -9 -f sparse_bullshark 2>/dev/null || true",
+        "sleep 3",
         "",
         "pids=()",
     ]
