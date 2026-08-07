@@ -69,7 +69,7 @@ def group_by_host(nodes):
 
 # ── Remote script builder ──────────────────────────────────────────────────────
 
-def build_remote_script(node_ids, all_nodes, priv_keys, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, reduced_quorum, decoupled):
+def build_remote_script(node_ids, all_nodes, priv_keys, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, reduced_quorum, decoupled, wan_delay):
     """Build a bash script that runs all assigned nodes on one machine."""
     # Build the CSV content for the active subset of nodes so the binary sees
     # only the N nodes participating in this run (not the full 50-node file).
@@ -85,6 +85,17 @@ def build_remote_script(node_ids, all_nodes, priv_keys, tx_size, n_tx, mode, inp
         f"export PROTOCOL={mode}",
         "export RUST_LOG=warn",
     ]
+
+    # WAN emulation: inject one-way latency via tc netem on every outgoing packet.
+    # RTT ≈ 2 × wan_delay because both endpoints apply the delay symmetrically.
+    if wan_delay > 0:
+        lines += [
+            "",
+            "# WAN emulation — inject artificial latency on all outgoing packets",
+            "IFACE=$(ip -o -4 route show to default | awk '{print $5}' | head -1)",
+            "sudo tc qdisc del dev \"$IFACE\" root 2>/dev/null || true",
+            f"sudo tc qdisc add dev \"$IFACE\" root netem delay {wan_delay}ms",
+        ]
     if input_rate > 0:
         lines.append(f"export INPUT_RATE={input_rate}")
     if mode == "sailfish":
@@ -115,12 +126,15 @@ def build_remote_script(node_ids, all_nodes, priv_keys, tx_size, n_tx, mode, inp
             f">/tmp/sb_{nid}.out 2>/tmp/sb_{nid}.err & pids+=($!)"
         )
 
-    lines += [
-        "",
-        'for pid in "${pids[@]}"; do wait "$pid"; done',
-        "",
-        "# Output each node's results with a clear separator",
-    ]
+    cleanup = ["", 'for pid in "${pids[@]}"; do wait "$pid"; done']
+    if wan_delay > 0:
+        cleanup += [
+            "",
+            "# Remove tc rule after the run",
+            "sudo tc qdisc del dev \"$IFACE\" root 2>/dev/null || true",
+        ]
+    cleanup += ["", "# Output each node's results with a clear separator"]
+    lines += cleanup
     for nid in node_ids:
         lines.append(f'echo "__SB_NODE_{nid}_START__"')
         lines.append(f"cat /tmp/sb_{nid}.out")
@@ -232,6 +246,9 @@ async def main():
                         help="Use f+1 quorum instead of 2f+1 (CFT threshold, not BFT-safe)")
     parser.add_argument("--decoupled",    action="store_true",
                         help="Enable MEMPOOL_MODE=decoupled (Narwhal-style batch store)")
+    parser.add_argument("--wan-delay",    type=int, default=0, metavar="MS",
+                        help="One-way WAN latency to inject via tc netem (ms). RTT ≈ 2×value. "
+                             "0 = no delay (LAN). Example: --wan-delay 50 → 100ms RTT")
     parser.add_argument("--logs",         action="store_true", help="Print stderr from each machine")
     args = parser.parse_args()
 
@@ -251,7 +268,8 @@ async def main():
     rbc_suffix     = f" [{args.rbc}]" if args.mode == "sailfish" else ""
     quorum_suffix  = " [quorum: f+1]" if (args.mode == "prbc_sailfish" and args.reduced_quorum) else ""
     mempool_suffix = " [decoupled]" if args.decoupled else ""
-    print(f"  Protocol:   {args.mode.replace('_', '-').upper()}{rbc_suffix}{quorum_suffix}{mempool_suffix}")
+    wan_suffix     = f" [WAN {args.wan_delay}ms one-way / {args.wan_delay*2}ms RTT]" if args.wan_delay > 0 else ""
+    print(f"  Protocol:   {args.mode.replace('_', '-').upper()}{rbc_suffix}{quorum_suffix}{mempool_suffix}{wan_suffix}")
     print(f"  Tx size:    {args.tx_size} B")
     print(f"  Tx/block:   {args.n_tx}")
     print(f"  Nodes:      {len(nodes)}")
@@ -270,7 +288,7 @@ async def main():
         script = build_remote_script(
             node_ids, nodes, priv_keys, args.tx_size, args.n_tx,
             args.mode, args.input_rate, args.rbc, args.no_prbc_sigs, args.reduced_quorum,
-            args.decoupled,
+            args.decoupled, args.wan_delay,
         )
         machine_order.append((ip, node_ids))
         tasks.append(asyncio.create_task(run_on_machine(ip, script, timeout_secs)))
