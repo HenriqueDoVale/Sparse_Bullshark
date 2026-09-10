@@ -64,8 +64,17 @@ PRBC holds up under WAN while Sailfish inline collapses.
 "first message" equivalent, one round trip) → `may_advance_round` (needs 2f+1
 hash-committed vertices) → `try_committing_prbc` (leader witnessed by 2f+1 in
 r+1) → `commit_causal_history_prbc` (traverses **strong + weak** edges) →
-`on_execution_ready` once the payload is verified. Missing payload at hash-quorum
-triggers **Phase-3 recovery** (`start_recovery` / `tick_recovery`).
+`on_execution_ready` once the payload is verified.
+
+**Payload lag ≠ error.** A digest-vote quorum (Control plane, tiny) routinely
+completes before the 256KB payload finishes on the Dissemination plane. That arms
+`start_recovery`, but `tick_recovery` only sends a `PRBCRecovery` after
+`RECOVERY_TIMEOUT_MS` (500ms) and `on_execution_ready` cancels it the instant the
+propose/batch lands — the common case. Stats counters:
+`Payload-lag events` (quorum before local payload) ≈ `Payload post-quorum`
+(propose then arrived on its own), while `Network recoveries` / `Recovery resp OK`
+(actual wire fetches) stay near zero. High lag count with ~zero network
+recoveries = the plane decoupling working, not a failure.
 
 ### Decoupled mempool (`sailfish.rs` + `mempool.rs`)
 

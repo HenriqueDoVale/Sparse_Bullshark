@@ -383,9 +383,17 @@ pub struct PRBCSailfish {
     total_e2e_latency_us: u128,
     e2e_committed_count: u64,
 
-    // Diagnostic counters (printed in stats, medianised by run_linux.py)
-    recovery_triggered_count: usize, // Phase 3 recovery started (no payload at hash-quorum)
-    race_condition_count: usize,     // propose arrived after hash_committed was already set
+    // Diagnostic counters (printed in stats, medianised by run_linux.py).
+    // A hash-vote quorum (32-byte digests, Control plane) routinely completes
+    // before the 256 KB payload finishes propagating on the separate
+    // Dissemination plane. That is the decoupling working as intended, not an
+    // error — these track how wide the gap is and how often it actually forces
+    // a network fetch (almost never: the propose/batch normally arrives first).
+    payload_lag_count: usize,         // hash-quorum reached before the local payload
+    payload_post_quorum_count: usize, // propose then arrived on its own — no fetch needed
+    recovery_requests_sent: usize,    // PRBCRecovery messages actually put on the wire
+    recovery_responses_ok: usize,     // valid PRBCRecoveryResp certificates applied locally
+    recovery_responses_served: usize, // PRBCRecoveryResp this node sent to answer a peer
     network_traffic: Arc<NetworkTrafficStats>,
     network_limit_mbps: Option<f64>,
     consensus_network_percent: f64,
@@ -472,8 +480,11 @@ impl PRBCSailfish {
             total_e2e_latency_us: 0,
             e2e_committed_count: 0,
 
-            recovery_triggered_count: 0,
-            race_condition_count: 0,
+            payload_lag_count: 0,
+            payload_post_quorum_count: 0,
+            recovery_requests_sent: 0,
+            recovery_responses_ok: 0,
+            recovery_responses_served: 0,
             network_traffic: Arc::new(NetworkTrafficStats::default()),
             network_limit_mbps,
             consensus_network_percent,
@@ -834,8 +845,11 @@ impl PRBCSailfish {
         if let Some(full_vertex) = self.prbc_payloads.remove(&hash) {
             self.on_execution_ready(hash.clone(), full_vertex, dispatcher_tx).await;
         } else if source != self.environment.my_node.id {
-            // Start Phase 3 recovery: we have 2f+1 votes but no payload.
-            self.recovery_triggered_count += 1;
+            // Hash-quorum before local payload. Arm a recovery state machine —
+            // but it only sends a PRBCRecovery after recovery_timeout_ms, and
+            // on_execution_ready cancels it the moment the propose/batch lands,
+            // which is the common case. Escalation to the wire is rare.
+            self.payload_lag_count += 1;
             let vote_list: Vec<NodeId> = votes.keys().cloned().collect();
             self.start_recovery(hash.clone(), vote_list);
         }
@@ -1067,7 +1081,7 @@ impl PRBCSailfish {
                 return;
             }
 
-            self.race_condition_count += 1;
+            self.payload_post_quorum_count += 1;
             self.on_execution_ready(hash, vertex, dispatcher_tx).await;
             return;
         }
@@ -1334,6 +1348,7 @@ impl PRBCSailfish {
                             }),
                         ))
                         .await;
+                    self.recovery_responses_served += 1;
                 }
             }
         }
@@ -1409,6 +1424,8 @@ impl PRBCSailfish {
             self.force_recovery_retry(&hash);
             return;
         }
+
+        self.recovery_responses_ok += 1;
 
         // Payload is valid — store and mark execution-ready.
         let digest = msg.vertex.block.clone();
@@ -1531,6 +1548,7 @@ impl PRBCSailfish {
                             }),
                         ))
                         .await;
+                    self.recovery_requests_sent += 1;
                     let state = self.recovery_state.get_mut(&hash).unwrap();
                     state.request_sent_at = Instant::now();
                     state.requested_from = Some(target);
@@ -2296,8 +2314,11 @@ impl PRBCSailfish {
         println!("  E2E latency:          {:.1} ms", avg_e2e_ms);
         println!("  Execution TPS:        {:.0} tx/s", exe_tps);
         println!("  Execution BPS:        {:.0} B/s", exe_bps);
-        println!("  Phase-3 recoveries:   {}", self.recovery_triggered_count);
-        println!("  Race cond. hits:      {}", self.race_condition_count);
+        println!("  Payload-lag events:   {}", self.payload_lag_count);
+        println!("  Payload post-quorum:  {}", self.payload_post_quorum_count);
+        println!("  Network recoveries:   {}", self.recovery_requests_sent);
+        println!("  Recovery resp OK:     {}", self.recovery_responses_ok);
+        println!("  Recovery resp served:  {}", self.recovery_responses_served);
         println!("  Batches cached:       {}", self.batch_store.len());
         println!("  Control TX bytes:     {} B", control_tx);
         println!("  Control RX bytes:     {} B", control_rx);
