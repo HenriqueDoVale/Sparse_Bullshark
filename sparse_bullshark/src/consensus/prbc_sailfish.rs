@@ -31,6 +31,7 @@ use crate::{
         },
     },
     types::vertex::{NodeId, TimeoutCertificate, Vertex, VertexHash},
+    utils::metrics::ResourceMeter,
 };
 
 // ── Network constants (mirrors sailfish.rs) ──────────────────────────────────
@@ -399,6 +400,9 @@ pub struct PRBCSailfish {
     // Configurable timeouts (ms), read from env vars ROUND_TIMEOUT_MS / RECOVERY_TIMEOUT_MS
     round_timeout_ms: u128,
     recovery_timeout_ms: u128,
+
+    // Per-process CPU / memory sampling, started when the timed run begins.
+    resource_meter: Option<ResourceMeter>,
 }
 
 impl PRBCSailfish {
@@ -482,6 +486,8 @@ impl PRBCSailfish {
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
             recovery_timeout_ms: std::env::var("RECOVERY_TIMEOUT_MS")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
+
+            resource_meter: None,
         };
         node.add_genesis_block();
         node
@@ -1762,6 +1768,7 @@ impl PRBCSailfish {
 
         let start_time = Instant::now();
         let duration = Duration::from_secs(EXECUTION_DURATION);
+        self.resource_meter = Some(ResourceMeter::start());
 
         // Initial kick
         self.process_work_loop(&dispatcher_tx).await;
@@ -2303,5 +2310,18 @@ impl PRBCSailfish {
         println!("  Consensus TX share:   {:.1} %", consensus_tx_share);
         println!("  Consensus network:    {:.3} Mbps", consensus_tx_mbps);
         println!("  Dissemination network:  {:.3} Mbps", dissemination_tx_mbps);
+
+        match self.resource_meter.as_ref().map(|m| m.report()) {
+            Some(r) if r.available => {
+                println!("  Process CPU 1core %:  {:.1}", r.cpu_pct_one_core);
+                println!("  Process CPU machine %:  {:.1}", r.cpu_pct_machine);
+                println!("  CPU sample window s:  {:.1}", r.wall_secs);
+                println!("  Process user CPU s:   {:.2}", r.user_cpu_secs);
+                println!("  Process sys CPU s:    {:.2}", r.sys_cpu_secs);
+                println!("  Process peak RSS MB:  {:.0}", r.peak_rss_mb);
+                println!("  Machine cores:        {}", r.n_cores);
+            }
+            _ => println!("  Process CPU:          n/a (no /proc)"),
+        }
     }
 }

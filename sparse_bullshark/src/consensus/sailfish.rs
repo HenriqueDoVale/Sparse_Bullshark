@@ -17,6 +17,7 @@ use crate::{
         SparseMessage, VertexMessage, TimeoutMessage, BatchMessage, BatchRequestMessage,
     }},
     types::vertex::{NodeId, Vertex, VertexHash, TimeoutCertificate},
+    utils::metrics::{ResourceMeter, WireCounters},
 };
 
 const NONCE_BYTES_LENGTH: usize = 32;
@@ -81,6 +82,13 @@ pub struct Sailfish {
     // Commit is triggered on ≥2f+1 first messages — no full RBC delivery needed
     // (Sailfish paper, lines 70-71).
     first_messages: HashMap<u64, Vec<(NodeId, Vec<VertexHash>)>>,
+
+    // Per-process CPU / memory sampling, started when the timed run begins.
+    resource_meter: Option<ResourceMeter>,
+    // Total socket bytes written / read, tallied in the dispatcher and the
+    // per-connection reader. Sailfish has no plane-level breakdown, so this is
+    // the whole-node network volume.
+    wire: Arc<WireCounters>,
 }
 
 impl Sailfish {
@@ -135,6 +143,9 @@ impl Sailfish {
             pending_on_batch: HashMap::new(),
 
             first_messages: HashMap::new(),
+
+            resource_meter: None,
+            wire: WireCounters::new(),
         };
         node.add_genesis_block();
         node
@@ -631,6 +642,7 @@ impl Sailfish {
 
         let start_time = Instant::now();
         let duration = Duration::from_secs(EXECUTION_DURATION);
+        self.resource_meter = Some(ResourceMeter::start());
 
         // Initial Kick
         self.process_work_loop(&dispatcher_tx).await;
@@ -903,8 +915,9 @@ impl Sailfish {
                             let msg_sender = message_sender.clone();
                             let pks = self.public_keys.clone();
                             let test_flag = self.environment.test_flag;
+                            let wire = self.wire.clone();
                             tokio::spawn(async move {
-                                Self::handle_connection(stream, msg_sender, my_id, claimed_id, pks, test_flag).await;
+                                Self::handle_connection(stream, msg_sender, my_id, claimed_id, pks, test_flag, wire).await;
                             });
                             accepted += 1;
                             info!("[Node {}] Accepted connection from Node {} ({}/{})",
@@ -939,6 +952,7 @@ impl Sailfish {
         peer_id: NodeId,
         _public_keys: HashMap<NodeId, PublicKey>,
         _test_flag: bool,
+        wire: Arc<WireCounters>,
     ) {
         info!("[Node {}] Listening for messages from Node {}", my_id, peer_id);
         loop {
@@ -955,6 +969,7 @@ impl Sailfish {
             // (TCP handshake already authenticates the sender).
             let mut sig_bytes = [0u8; 64];
             if stream.read_exact(&mut sig_bytes).await.is_err() { return; }
+            wire.add_rx((MESSAGE_BYTES_LENGTH + length as usize + SIGNATURE_BYTES_LENGTH) as u64);
             if let Ok(message) = deserialize(&buffer) {
                 if message_sender.send((peer_id, message)).await.is_err() {
                     return;
@@ -972,6 +987,7 @@ impl Sailfish {
     ) {
         let private_key = self.private_key.clone();
         let test_flag = self.environment.test_flag;
+        let wire = self.wire.clone();
 
         // Build one write task per peer per plane. Each writer drains its own queue
         // independently, so a large Vertex or Batch frame on the data channel never
@@ -1022,17 +1038,22 @@ impl Sailfish {
                         _ => &ctrl_senders,
                     };
 
+                    let frame_len = frame.len() as u64;
                     match target {
                         None => {
                             for tx in senders.iter() {
                                 if let Some(sender) = tx {
-                                    let _ = sender.send(frame.clone()).await;
+                                    if sender.send(frame.clone()).await.is_ok() {
+                                        wire.add_tx(frame_len);
+                                    }
                                 }
                             }
                         }
                         Some(peer_id) => {
                             if let Some(Some(tx)) = senders.get(peer_id as usize) {
-                                let _ = tx.send(frame).await;
+                                if tx.send(frame).await.is_ok() {
+                                    wire.add_tx(frame_len);
+                                }
                             }
                         }
                     }
@@ -1092,6 +1113,26 @@ impl Sailfish {
         println!("  Consensus latency:    {:.1} ms", avg_latency_ms);
         if self.mempool_decoupled {
             println!("  Batches cached:       {}", self.batch_store.len());
+        }
+
+        let wire_tx = self.wire.tx();
+        let wire_rx = self.wire.rx();
+        println!("  Network TX MB:        {:.1}", wire_tx as f64 / 1_048_576.0);
+        println!("  Network RX MB:        {:.1}", wire_rx as f64 / 1_048_576.0);
+        println!("  Network TX Mbps:      {:.3}", wire_tx as f64 * 8.0 / exec_secs / 1_000_000.0);
+        println!("  Network RX Mbps:      {:.3}", wire_rx as f64 * 8.0 / exec_secs / 1_000_000.0);
+
+        match self.resource_meter.as_ref().map(|m| m.report()) {
+            Some(r) if r.available => {
+                println!("  Process CPU 1core %:  {:.1}", r.cpu_pct_one_core);
+                println!("  Process CPU machine %:  {:.1}", r.cpu_pct_machine);
+                println!("  CPU sample window s:  {:.1}", r.wall_secs);
+                println!("  Process user CPU s:   {:.2}", r.user_cpu_secs);
+                println!("  Process sys CPU s:    {:.2}", r.sys_cpu_secs);
+                println!("  Process peak RSS MB:  {:.0}", r.peak_rss_mb);
+                println!("  Machine cores:        {}", r.n_cores);
+            }
+            _ => println!("  Process CPU:          n/a (no /proc)"),
         }
     }
 }
