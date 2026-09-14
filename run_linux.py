@@ -338,6 +338,21 @@ async def main():
 
     print_summary(all_configs[0], compute_median(all_results), len(all_results))
 
+    # Recovery counters are often concentrated on one or two nodes (e.g. the
+    # node a Byz1 proposer excludes) — the median across all nodes can then
+    # read as ~0 even when a real, nonzero number of events happened
+    # somewhere. --logs breaks that out per node so it's not hidden.
+    if args.logs:
+        cols = ["Payload-lag events", "Network recoveries", "Recovery resp OK", "Recovery resp served"]
+        if any(c in all_results[0] for c in cols):
+            print("--------------------------------------------------")
+            print(" PER-NODE RECOVERY COUNTERS")
+            print("--------------------------------------------------")
+            print(f"{'Node':>6}  " + "  ".join(f"{c:>20}" for c in cols))
+            for i, res in enumerate(all_results):
+                print(f"{nodes[i]['id']:>6}  " + "  ".join(f"{res.get(c, '-'):>20}" for c in cols))
+            print()
+
     if args.logs:
         print("--------------------------------------------------")
         print(" NODE LOGS (stderr)")

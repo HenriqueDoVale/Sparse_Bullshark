@@ -69,7 +69,7 @@ def group_by_host(nodes):
 
 # ── Remote script builder ──────────────────────────────────────────────────────
 
-def build_remote_script(node_ids, all_nodes, priv_keys, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, reduced_quorum, decoupled, wan_delay):
+def build_remote_script(node_ids, all_nodes, priv_keys, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, reduced_quorum, decoupled, wan_delay, recovery_timeout_ms):
     """Build a bash script that runs all assigned nodes on one machine."""
     # Build the CSV content for the active subset of nodes so the binary sees
     # only the N nodes participating in this run (not the full 50-node file).
@@ -106,6 +106,8 @@ def build_remote_script(node_ids, all_nodes, priv_keys, tx_size, n_tx, mode, inp
         lines.append("export REDUCED_QUORUM=on")
     if decoupled:
         lines.append("export MEMPOOL_MODE=decoupled")
+    if recovery_timeout_ms is not None:
+        lines.append(f"export RECOVERY_TIMEOUT_MS={recovery_timeout_ms}")
 
     for nid in node_ids:
         # Single-quote the key: base64 chars never contain single quotes
@@ -170,10 +172,10 @@ async def run_on_machine(ip, script, timeout_secs):
 # ── Output parsing ─────────────────────────────────────────────────────────────
 
 def split_node_outputs(combined):
-    """Split the concatenated machine output into individual node blocks."""
-    blocks = re.findall(r'__SB_NODE_\d+_START__\n(.*?)__SB_NODE_\d+_END__',
+    """Split the concatenated machine output into (node_id, block) pairs."""
+    matches = re.findall(r'__SB_NODE_(\d+)_START__\n(.*?)__SB_NODE_\d+_END__',
                         combined, re.DOTALL)
-    return [b.strip() for b in blocks if b.strip()]
+    return [(int(nid), b.strip()) for nid, b in matches if b.strip()]
 
 
 def parse_block(output):
@@ -249,6 +251,11 @@ async def main():
     parser.add_argument("--wan-delay",    type=int, default=0, metavar="MS",
                         help="One-way WAN latency to inject via tc netem (ms). RTT ≈ 2×value. "
                              "0 = no delay (LAN). Example: --wan-delay 50 → 100ms RTT")
+    parser.add_argument("--recovery-timeout-ms", type=int, default=None, metavar="MS",
+                        help="Override RECOVERY_TIMEOUT_MS on all cluster nodes "
+                             "(binary default: 500ms). Set very low (e.g. 5) to force "
+                             "Phase-3 recovery to escalate to the network instead of "
+                             "resolving locally, for testing the recovery path itself.")
     parser.add_argument("--logs",         action="store_true", help="Print stderr from each machine")
     args = parser.parse_args()
 
@@ -269,7 +276,8 @@ async def main():
     quorum_suffix  = " [quorum: f+1]" if (args.mode == "prbc_sailfish" and args.reduced_quorum) else ""
     mempool_suffix = " [decoupled]" if args.decoupled else ""
     wan_suffix     = f" [WAN {args.wan_delay}ms one-way / {args.wan_delay*2}ms RTT]" if args.wan_delay > 0 else ""
-    print(f"  Protocol:   {args.mode.replace('_', '-').upper()}{rbc_suffix}{quorum_suffix}{mempool_suffix}{wan_suffix}")
+    recovery_suffix = f" [recovery timeout: {args.recovery_timeout_ms}ms]" if args.recovery_timeout_ms is not None else ""
+    print(f"  Protocol:   {args.mode.replace('_', '-').upper()}{rbc_suffix}{quorum_suffix}{mempool_suffix}{wan_suffix}{recovery_suffix}")
     print(f"  Tx size:    {args.tx_size} B")
     print(f"  Tx/block:   {args.n_tx}")
     print(f"  Nodes:      {len(nodes)}")
@@ -288,7 +296,7 @@ async def main():
         script = build_remote_script(
             node_ids, nodes, priv_keys, args.tx_size, args.n_tx,
             args.mode, args.input_rate, args.rbc, args.no_prbc_sigs, args.reduced_quorum,
-            args.decoupled, args.wan_delay,
+            args.decoupled, args.wan_delay, args.recovery_timeout_ms,
         )
         machine_order.append((ip, node_ids))
         tasks.append(asyncio.create_task(run_on_machine(ip, script, timeout_secs)))
@@ -296,7 +304,7 @@ async def main():
     raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Parse results
-    all_configs, all_results = [], []
+    all_configs, all_results, all_node_ids = [], [], []
     all_stderr = {}
 
     for (ip, node_ids), result in zip(machine_order, raw_results):
@@ -316,13 +324,14 @@ async def main():
             print(f"  Last stderr: {stderr.splitlines()[-5:] if stderr else '(empty)'}", file=sys.stderr)
             continue
 
-        for block in node_blocks:
+        for nid, block in node_blocks:
             cfg, res = parse_block(block)
             if cfg and res:
                 all_configs.append(cfg)
                 all_results.append(res)
+                all_node_ids.append(nid)
             else:
-                print(f"Warning: a node on {ip} produced incomplete output.", file=sys.stderr)
+                print(f"Warning: node {nid} on {ip} produced incomplete output.", file=sys.stderr)
 
     if not all_results:
         print("No results to display — all nodes failed or produced no output.", file=sys.stderr)
@@ -330,6 +339,21 @@ async def main():
         sys.exit(1)
 
     print_summary(all_configs[0], compute_median(all_results), len(all_results))
+
+    # Recovery counters are often concentrated on one or two nodes (e.g. the
+    # peers a Byz1 proposer excludes) — the median across all nodes can then
+    # read as ~0 even when a real, nonzero number of events happened
+    # somewhere. --logs breaks that out per node so it's not hidden.
+    if args.logs:
+        cols = ["Payload-lag events", "Network recoveries", "Recovery resp OK", "Recovery resp served"]
+        if any(c in all_results[0] for c in cols):
+            print("--------------------------------------------------")
+            print(" PER-NODE RECOVERY COUNTERS")
+            print("--------------------------------------------------")
+            print(f"{'Node':>6}  " + "  ".join(f"{c:>20}" for c in cols))
+            for nid, res in sorted(zip(all_node_ids, all_results)):
+                print(f"{nid:>6}  " + "  ".join(f"{res.get(c, '-'):>20}" for c in cols))
+            print()
 
     if args.logs:
         print("--------------------------------------------------")
