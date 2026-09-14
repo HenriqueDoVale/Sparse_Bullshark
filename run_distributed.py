@@ -81,7 +81,11 @@ def build_remote_script(node_ids, all_nodes, priv_keys, tx_size, n_tx, mode, inp
     lines = [
         "#!/bin/bash",
         f"cd {WORK_DIR}",
-        f"printf '{csv_content}\\n' > shared/nodes_distributed.csv",
+        # The binary reads ./shared/nodes.csv (hardcoded, see
+        # shared/src/initializer.rs). Writing to nodes_distributed.csv here
+        # instead would be silently inert — this must overwrite the file the
+        # binary actually loads on every run.
+        f"printf '{csv_content}\\n' > shared/nodes.csv",
         f"export PROTOCOL={mode}",
         "export RUST_LOG=warn",
     ]
