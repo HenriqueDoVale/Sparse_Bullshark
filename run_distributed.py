@@ -145,6 +145,12 @@ def build_remote_script(node_ids, all_nodes, priv_keys, tx_size, n_tx, mode, inp
         lines.append(f'echo "__SB_NODE_{nid}_START__"')
         lines.append(f"cat /tmp/sb_{nid}.out")
         lines.append(f'echo "__SB_NODE_{nid}_END__"')
+        # The binary's own warn!/error! output goes to this file (stdout is
+        # reserved for the CONFIG/RESULTS block) — retrieve it too, or every
+        # warn! this run produced is silently stranded on the remote machine.
+        lines.append(f'echo "__SB_NODE_{nid}_ERR_START__"')
+        lines.append(f"cat /tmp/sb_{nid}.err")
+        lines.append(f'echo "__SB_NODE_{nid}_ERR_END__"')
 
     return "\n".join(lines)
 
@@ -178,6 +184,14 @@ async def run_on_machine(ip, script, timeout_secs):
 def split_node_outputs(combined):
     """Split the concatenated machine output into (node_id, block) pairs."""
     matches = re.findall(r'__SB_NODE_(\d+)_START__\n(.*?)__SB_NODE_\d+_END__',
+                        combined, re.DOTALL)
+    return [(int(nid), b.strip()) for nid, b in matches if b.strip()]
+
+
+def split_node_err_outputs(combined):
+    """Split out each node's own warn!/error! log (its stderr file, cat'd back
+    separately from stdout — see build_remote_script). Only non-empty logs."""
+    matches = re.findall(r'__SB_NODE_(\d+)_ERR_START__\n(.*?)__SB_NODE_\d+_ERR_END__',
                         combined, re.DOTALL)
     return [(int(nid), b.strip()) for nid, b in matches if b.strip()]
 
@@ -310,6 +324,7 @@ async def main():
     # Parse results
     all_configs, all_results, all_node_ids = [], [], []
     all_stderr = {}
+    node_binary_logs = {}
 
     for (ip, node_ids), result in zip(machine_order, raw_results):
         if isinstance(result, Exception):
@@ -321,6 +336,9 @@ async def main():
 
         if rc != 0:
             print(f"Warning: {ip} exited with code {rc}", file=sys.stderr)
+
+        for nid, err in split_node_err_outputs(stdout):
+            node_binary_logs[nid] = err
 
         node_blocks = split_node_outputs(stdout)
         if not node_blocks:
@@ -361,7 +379,17 @@ async def main():
 
     if args.logs:
         print("--------------------------------------------------")
-        print(" MACHINE LOGS (stderr)")
+        print(" PER-NODE BINARY LOGS (warn!/error!)")
+        print("--------------------------------------------------")
+        if node_binary_logs:
+            for nid in sorted(node_binary_logs):
+                print(f"\n--- Node {nid} ---")
+                print(node_binary_logs[nid])
+        else:
+            print("(none — no node produced any warn!/error! output)")
+
+        print("\n--------------------------------------------------")
+        print(" SSH/BASH SESSION STDERR (script-level errors, not the binary's own logs)")
         print("--------------------------------------------------")
         for ip, stderr in all_stderr.items():
             if stderr.strip():
