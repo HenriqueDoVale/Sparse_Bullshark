@@ -103,6 +103,7 @@ is the "inline signed vote" variant used in the WAN experiment.
 | `ROUND_TIMEOUT_MS` | round timeout, default 500 |
 | `RECOVERY_TIMEOUT_MS` | Phase-3 recovery retry timeout |
 | `NETWORK_MBPS` / `CONSENSUS_NETWORK_PERCENT` | dissemination-plane bandwidth pacer |
+| `PRBC_SAMPLE_C` | PRBC only — overrides the `1.4` in `sample_size=ceil(C·√n)` for the S1/S2 relay set. Bigger = more redundancy/network, fewer genuine recoveries |
 
 `EXECUTION_DURATION = 60` (seconds) is a compile-time const in both consensus files.
 
@@ -246,6 +247,9 @@ deadlock (n=50). O(n²) inline-payload amplification.
 - Update the WAN artifact with Narwhal once collected.
 - Artifacts (claude.ai): `benchmark_summary` `53d58a79-...`, `wan_experiment`
   `7067df05-...`.
+- **Recovery-mechanism testing** (Byz1 fault injection, timeout sweeps,
+  theoretical model vs. observed escalation rate across n=7-10) — full
+  writeup in `RECOVERY_TESTING.md`. f=3 simultaneous-fault test in progress.
 
 ## Professor's correctness points (all addressed — see memory `protocol_feedback.md`)
 

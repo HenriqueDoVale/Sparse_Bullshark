@@ -46,8 +46,18 @@ const CONSENSUS_DATA_DRAIN_BUDGET: usize = 64;
 const DISSEMINATION_DRAIN_BUDGET: usize = 16;
 
 // ── Protocol constants ────────────────────────────────────────────────────────
-// Sample size = PRBC_C * sqrt(n), rounded up
-const PRBC_C: f64 = 1.4; // ceil(PRBC_C * sqrt(n)) ≈ 4 for n=8
+// Sample size = PRBC_C * sqrt(n), rounded up. Default 1.4 (ceil ≈ 4 for n=8) is
+// the value validated in RECOVERY_TESTING.md; override with PRBC_SAMPLE_C to
+// study how the redundancy/recovery/network tradeoff responds to a different
+// constant. Read fresh each call (cheap, once per batch — not a hot per-message
+// path) rather than cached, so it's safe to leave unset in the common case.
+fn prbc_c() -> f64 {
+    std::env::var("PRBC_SAMPLE_C")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(1.4)
+}
 
 /// Deterministically selects ⌈PRBC_C * √n⌉ node IDs for a given salt.
 /// Both the generator task and the consensus actor use this function so they
@@ -57,7 +67,7 @@ fn compute_sample_for_nodes(
     batch_hash: &[u8],
     salt: &[u8],
 ) -> HashSet<NodeId> {
-    let sample_size = ((node_ids.len() as f64).sqrt() * PRBC_C).ceil() as usize;
+    let sample_size = ((node_ids.len() as f64).sqrt() * prbc_c()).ceil() as usize;
     let sample_size = sample_size.min(node_ids.len());
 
     let mut seed_input = Vec::new();
@@ -2296,6 +2306,8 @@ impl PRBCSailfish {
         println!("  Faults:               {} node(s)", f_actual);
         println!("  Fault tolerance:      {} node(s)", f_tolerance);
         println!("  Committee size:       {} node(s)", n);
+        println!("  Sample C:             {:.2}", prbc_c());
+        println!("  Sample size:          {} node(s)", ((n as f64).sqrt() * prbc_c()).ceil() as usize);
         println!("  Input rate:           {}", rate_label);
         println!("  Transaction size:     {} B", tx_size);
         println!("  Transactions/block:   {}", n_tx);

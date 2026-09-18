@@ -69,7 +69,7 @@ def group_by_host(nodes):
 
 # ── Remote script builder ──────────────────────────────────────────────────────
 
-def build_remote_script(node_ids, all_nodes, priv_keys, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, reduced_quorum, decoupled, wan_delay, recovery_timeout_ms):
+def build_remote_script(node_ids, all_nodes, priv_keys, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, reduced_quorum, decoupled, wan_delay, recovery_timeout_ms, sample_c):
     """Build a bash script that runs all assigned nodes on one machine."""
     # Build the CSV content for the active subset of nodes so the binary sees
     # only the N nodes participating in this run (not the full 50-node file).
@@ -112,6 +112,8 @@ def build_remote_script(node_ids, all_nodes, priv_keys, tx_size, n_tx, mode, inp
         lines.append("export MEMPOOL_MODE=decoupled")
     if recovery_timeout_ms is not None:
         lines.append(f"export RECOVERY_TIMEOUT_MS={recovery_timeout_ms}")
+    if sample_c is not None and mode == "prbc_sailfish":
+        lines.append(f"export PRBC_SAMPLE_C={sample_c}")
 
     for nid in node_ids:
         # Single-quote the key: base64 chars never contain single quotes
@@ -274,6 +276,11 @@ async def main():
                              "(binary default: 500ms). Set very low (e.g. 5) to force "
                              "Phase-3 recovery to escalate to the network instead of "
                              "resolving locally, for testing the recovery path itself.")
+    parser.add_argument("--sample-c",     type=float, default=None, metavar="C",
+                        help="Override PRBC_SAMPLE_C (PRBC-Sailfish only): the constant in "
+                             "sample_size=ceil(C*sqrt(n)) for the S1/S2 relay redundancy set. "
+                             "Binary default: 1.4. Bigger = more relay redundancy/network, "
+                             "fewer genuine Phase-3 recoveries needed; smaller = the opposite.")
     parser.add_argument("--logs",         action="store_true", help="Print stderr from each machine")
     args = parser.parse_args()
 
@@ -295,7 +302,8 @@ async def main():
     mempool_suffix = " [decoupled]" if args.decoupled else ""
     wan_suffix     = f" [WAN {args.wan_delay}ms one-way / {args.wan_delay*2}ms RTT]" if args.wan_delay > 0 else ""
     recovery_suffix = f" [recovery timeout: {args.recovery_timeout_ms}ms]" if args.recovery_timeout_ms is not None else ""
-    print(f"  Protocol:   {args.mode.replace('_', '-').upper()}{rbc_suffix}{quorum_suffix}{mempool_suffix}{wan_suffix}{recovery_suffix}")
+    sample_c_suffix = f" [sample C: {args.sample_c}]" if args.sample_c is not None else ""
+    print(f"  Protocol:   {args.mode.replace('_', '-').upper()}{rbc_suffix}{quorum_suffix}{mempool_suffix}{wan_suffix}{recovery_suffix}{sample_c_suffix}")
     print(f"  Tx size:    {args.tx_size} B")
     print(f"  Tx/block:   {args.n_tx}")
     print(f"  Nodes:      {len(nodes)}")
@@ -314,7 +322,7 @@ async def main():
         script = build_remote_script(
             node_ids, nodes, priv_keys, args.tx_size, args.n_tx,
             args.mode, args.input_rate, args.rbc, args.no_prbc_sigs, args.reduced_quorum,
-            args.decoupled, args.wan_delay, args.recovery_timeout_ms,
+            args.decoupled, args.wan_delay, args.recovery_timeout_ms, args.sample_c,
         )
         machine_order.append((ip, node_ids))
         tasks.append(asyncio.create_task(run_on_machine(ip, script, timeout_secs)))
