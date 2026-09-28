@@ -419,6 +419,16 @@ pub struct PRBCSailfish {
     round_timeout_ms: u128,
     recovery_timeout_ms: u128,
 
+    // Optional cap (ms) on the synthetic batch-generator's tick interval, read
+    // from MAX_BATCH_DELAY_MS. None (default/unset) reproduces today's exact
+    // pacing: interval = n_tx * n_nodes / input_rate, uncapped.
+    max_batch_delay_ms: Option<u64>,
+    // The actual per-batch transaction count the generator task is using.
+    // Equals environment.n_transactions unless max_batch_delay_ms engaged and
+    // shrank it proportionally. Mirrored here so print_dag_stats() reports
+    // real throughput instead of assuming a full-size batch every time.
+    effective_n_tx: usize,
+
     // Per-process CPU / memory sampling, started when the timed run begins.
     resource_meter: Option<ResourceMeter>,
 }
@@ -431,6 +441,7 @@ impl PRBCSailfish {
     ) -> Self {
         println!("PRBCSailfish");
         let n = environment.nodes.len();
+        let n_tx_default = environment.n_transactions;
         let f = (n.saturating_sub(1)) / 3;
         let network_limit_mbps = std::env::var("NETWORK_MBPS")
             .ok()
@@ -507,6 +518,10 @@ impl PRBCSailfish {
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
             recovery_timeout_ms: std::env::var("RECOVERY_TIMEOUT_MS")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
+
+            max_batch_delay_ms: std::env::var("MAX_BATCH_DELAY_MS")
+                .ok().and_then(|v| v.parse::<u64>().ok()).filter(|&v| v > 0),
+            effective_n_tx: n_tx_default,
 
             resource_meter: None,
         };
@@ -1694,13 +1709,45 @@ impl PRBCSailfish {
         let input_rate = self.environment.input_rate;
         let source = self.environment.my_node.id;
         let node_ids: Vec<NodeId> = self.environment.nodes.iter().map(|node| node.id).collect();
+
+        // Resolve the effective per-tick batch size and interval once, up
+        // front, so print_dag_stats() and the CONFIG printout can both report
+        // the actual configuration the generator task below will use. When
+        // MAX_BATCH_DELAY_MS is unset (the default), this reproduces today's
+        // exact pacing: effective_interval_us == natural_interval_us and
+        // effective_n_tx == n_tx, unconditionally.
+        let (effective_interval_us, effective_n_tx): (u64, usize) = if input_rate > 0 {
+            let per_node_rate = (input_rate / n_nodes).max(1);
+            let natural_interval_us = ((n_tx as u64 * 1_000_000) / per_node_rate).max(1);
+            let eff_interval = match self.max_batch_delay_ms.map(|ms| ms.saturating_mul(1000)) {
+                Some(cap) => natural_interval_us.min(cap).max(1),
+                None => natural_interval_us,
+            };
+            let eff_n_tx = if eff_interval == natural_interval_us {
+                n_tx
+            } else {
+                let ideal = (n_tx as u128 * eff_interval as u128) / natural_interval_us as u128;
+                if ideal < 1 {
+                    warn!(
+                        "[Node {}] MAX_BATCH_DELAY_MS cap forces batch size below 1 tx; \
+                         configured aggregate rate cannot be preserved exactly for this \
+                         n_tx/rate/committee combination",
+                        self.environment.my_node.id
+                    );
+                }
+                ideal.max(1) as usize
+            };
+            (eff_interval, eff_n_tx)
+        } else {
+            (0, n_tx)
+        };
+        self.effective_n_tx = effective_n_tx;
+
         let (batch_tx, batch_rx) =
             tokio::sync::mpsc::channel::<(PRBCBatchMessage, Instant)>(64);
         self.batch_receiver = Some(batch_rx);
         let batch_dispatcher = dispatcher_tx.clone();
         tokio::spawn(async move {
-            let mut gen = TransactionGenerator::new(tx_size, n_tx);
-
             async fn disseminate_then_enqueue(
                 source: NodeId,
                 payload: Vec<u8>,
@@ -1753,9 +1800,8 @@ impl PRBCSailfish {
             }
 
             if input_rate > 0 {
-                let per_node_rate = (input_rate / n_nodes).max(1);
-                let interval_us = ((n_tx as u64 * 1_000_000) / per_node_rate).max(1);
-                let mut ticker = tokio::time::interval(Duration::from_micros(interval_us));
+                let mut gen = TransactionGenerator::new(tx_size, effective_n_tx);
+                let mut ticker = tokio::time::interval(Duration::from_micros(effective_interval_us));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     ticker.tick().await;
@@ -1775,6 +1821,7 @@ impl PRBCSailfish {
                     }
                 }
             } else {
+                let mut gen = TransactionGenerator::new(tx_size, n_tx);
                 loop {
                     let transactions = gen.generate();
                     let created_at = Instant::now();
@@ -2236,7 +2283,13 @@ impl PRBCSailfish {
                               .filter(|node| node.behavior != NodeBehavior::Ok)
                               .count();
         let tx_size    = self.environment.transaction_size;
-        let n_tx       = self.environment.n_transactions;
+        // Actual per-batch tx count the generator task is using (may be
+        // smaller than environment.n_transactions if MAX_BATCH_DELAY_MS
+        // engaged) — throughput/CONFIG reporting must use this, not the
+        // originally-configured count, or every TPS number below would be
+        // silently inflated whenever the cap shrinks the real batch size.
+        let n_tx           = self.effective_n_tx;
+        let n_tx_configured = self.environment.n_transactions;
         let exec_secs  = EXECUTION_DURATION as f64;
 
         let con_tx    = self.consensus_committed_count * n_tx;
@@ -2300,6 +2353,22 @@ impl PRBCSailfish {
             };
 
         let quorum_label = if self.reduced_quorum { "f+1" } else { "2f+1" };
+        let max_batch_delay_label = match self.max_batch_delay_ms {
+            None => "disabled".to_string(),
+            Some(ms) => {
+                if self.environment.input_rate == 0 {
+                    format!("{} ms (not engaged - input rate unlimited)", ms)
+                } else {
+                    let per_node_rate = (self.environment.input_rate / n as u64).max(1);
+                    let natural_us = ((n_tx_configured as u64 * 1_000_000) / per_node_rate).max(1);
+                    if ms.saturating_mul(1000) < natural_us {
+                        format!("{} ms (engaged - natural batch interval was {} ms)", ms, natural_us / 1000)
+                    } else {
+                        format!("{} ms (not engaged - natural interval already <= cap)", ms)
+                    }
+                }
+            }
+        };
         println!("\n+ CONFIG:");
         println!("  Protocol:             PRBC-Sailfish (vote sigs: {}, quorum: {})", sigs_label, quorum_label);
         println!("  Mempool:              decoupled (batch digests)");
@@ -2309,6 +2378,7 @@ impl PRBCSailfish {
         println!("  Sample C:             {:.2}", prbc_c());
         println!("  Sample size:          {} node(s)", ((n as f64).sqrt() * prbc_c()).ceil() as usize);
         println!("  Input rate:           {}", rate_label);
+        println!("  Max batch delay:      {}", max_batch_delay_label);
         println!("  Transaction size:     {} B", tx_size);
         println!("  Transactions/block:   {}", n_tx);
         println!("  Block size:           {} B", n_tx * tx_size);

@@ -248,8 +248,36 @@ deadlock (n=50). O(n²) inline-payload amplification.
 - Artifacts (claude.ai): `benchmark_summary` `53d58a79-...`, `wan_experiment`
   `7067df05-...`.
 - **Recovery-mechanism testing** (Byz1 fault injection, timeout sweeps,
-  theoretical model vs. observed escalation rate across n=7-10) — full
-  writeup in `RECOVERY_TESTING.md`. f=3 simultaneous-fault test in progress.
+  theoretical model vs. observed escalation rate across n=7-10, f=3 scaling
+  confirmed linear) — full writeup in `RECOVERY_TESTING.md`. Done.
+- **4 new objectives** (why Narwhal's latency/network differs from PRBC,
+  `PRBC_SAMPLE_C` cost/benefit variance, fixed-latency TPS comparison): all
+  four done.
+  - #1/#2 (Narwhal latency/network vs PRBC): full writeup in
+    `OBJECTIVE1_2_ANALYSIS.md`. Unblocked by cloning the actual baseline
+    (`github.com/nibeshrestha/sailfish`, public) and reading the mempool/
+    primary source directly. Root cause for both is the same design choice:
+    Narwhal blocks (worker waits for 2f delivery acks before a digest is
+    header-eligible; primary suspends header processing until payload is
+    locally present) where PRBC doesn't (votes on the digest immediately,
+    pays in redundant S1/S2 relay network instead). Explains objective 4's
+    non-monotonicity too — Narwhal's blocking points are per-batch/per-node
+    and tail-sensitive, not a smooth function of load. Confirmed live (not
+    just code-argued): `monitor_cluster.py` during a matched 20k tx/s Narwhal
+    run measured ~67-70 Mbps NIC avg/machine — within a few % of the fitted
+    model's independently-calculated 73.7 Mbps bare-broadcast baseline, vs.
+    PRBC's measured 258.4 Mbps at the same rate/settings (~3.7× more for
+    PRBC). All three lines of evidence (code, model, live measurement) agree.
+  - #3 (PRBC_C) done — full writeup + fitted cost/benefit model in
+    `PRBC_C_TESTING.md`.
+  - #4 (fixed-latency-budget TPS) done — full writeup in
+    `OBJECTIVE4_TESTING.md`: PRBC's max TPS at ≤1000ms E2E ≈ its own ceiling
+    (~136-138k tx/s, smooth/reproducible curve); Narwhal's is erratic/
+    non-monotonic in the 15k-100k range with real run-to-run variance, best
+    read as ~19k-30k tx/s. PRBC wins 4.6-7×.
+  - **Next up:** build a claude.ai artifact summarizing all 4 objectives
+    (source material is the three MD files above), same treatment as the
+    "Past Week's Work" recovery artifact.
 
 ## Professor's correctness points (all addressed — see memory `protocol_feedback.md`)
 
