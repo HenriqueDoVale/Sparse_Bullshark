@@ -1274,24 +1274,10 @@ impl PRBCSailfish {
         vote: PRBCVoteMessage,
         dispatcher_tx: &MessageDispatcher,
     ) {
-        // When signing is on, verify the Ed25519 signature and use msg.voter as identity.
+        // When signing is on, the Ed25519 signature was already verified on the
+        // peer's reader task (handle_connection), so msg.voter is the identity.
         // When off, fall back to the TCP-authenticated sender.
-        let voter = if self.sign_votes {
-            match self.public_keys.get(&vote.voter).and_then(|pk| {
-                Signature::from_bytes(&vote.signature).ok().and_then(|sig| {
-                    pk.verify(&vote.hash, &sig).ok()
-                })
-            }) {
-                Some(_) => vote.voter,
-                None => {
-                    warn!("[Node {}] PRBC: invalid vote signature from node {}",
-                        self.environment.my_node.id, sender);
-                    return;
-                }
-            }
-        } else {
-            sender
-        };
+        let voter = if self.sign_votes { vote.voter } else { sender };
 
         debug!(
             "[Node {}] PRBCVote received: round={} source={} voter={}",
@@ -2020,6 +2006,10 @@ impl PRBCSailfish {
             }
         }
 
+        // Keys for checking vote signatures on the reader tasks; None when
+        // PRBC_SIGS=off.
+        let vote_keys = self.sign_votes.then(|| Arc::new(self.public_keys.clone()));
+
         // Incoming: 3×(n-1) connections, one per peer per plane.
         let mut accepted = 0;
         let mut accepted_peer_planes = HashSet::new();
@@ -2076,6 +2066,7 @@ impl PRBCSailfish {
                                 TrafficPlane::Dissemination => dissemination_sender.clone(),
                             };
                             let network_traffic = self.network_traffic.clone();
+                            let vote_keys = vote_keys.clone();
                             tokio::spawn(async move {
                                 Self::handle_connection(
                                     stream,
@@ -2084,6 +2075,7 @@ impl PRBCSailfish {
                                     claimed_id,
                                     plane,
                                     network_traffic,
+                                    vote_keys,
                                 )
                                 .await;
                             });
@@ -2122,6 +2114,7 @@ impl PRBCSailfish {
         peer_id: NodeId,
         plane: TrafficPlane,
         network_traffic: Arc<NetworkTrafficStats>,
+        vote_keys: Option<Arc<HashMap<NodeId, PublicKey>>>,
     ) {
         info!(
             "[Node {}] Listening for messages from Node {}",
@@ -2159,6 +2152,20 @@ impl PRBCSailfish {
                 let frame_bytes =
                     (MESSAGE_BYTES_LENGTH + length as usize + SIGNATURE_BYTES_LENGTH) as u64;
                 network_traffic.record_rx(plane, frame_bytes);
+                // Check vote signatures here, one reader task per peer, so the
+                // checks run in parallel instead of one at a time in the
+                // consensus loop. An invalid vote is dropped, as before.
+                if let (PRBCMessage::PRBCVote(vote), Some(keys)) = (&message, &vote_keys) {
+                    let valid = keys.get(&vote.voter).map_or(false, |pk| {
+                        Signature::from_bytes(&vote.signature)
+                            .map_or(false, |sig| pk.verify(&vote.hash, &sig).is_ok())
+                    });
+                    if !valid {
+                        warn!("[Node {}] PRBC: invalid vote signature from node {}",
+                            my_id, peer_id);
+                        continue;
+                    }
+                }
                 if message_sender.send((peer_id, message)).await.is_err() {
                     return;
                 }
@@ -2302,7 +2309,9 @@ impl PRBCSailfish {
         let exe_bps   = exe_bytes as f64 / exec_secs;
         let rps       = self.last_ordered_round as f64 / exec_secs;
 
-        let sigs_label  = if self.sign_votes { "on" } else { "off" };
+        // "checked on readers" marks builds that verify vote signatures on the
+        // per-connection reader tasks rather than in the consensus loop.
+        let sigs_label  = if self.sign_votes { "on, checked on readers" } else { "off" };
         let rate_label  = if self.environment.input_rate == 0 {
             "unlimited".to_string()
         } else {
