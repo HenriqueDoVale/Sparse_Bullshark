@@ -7,6 +7,7 @@ pub enum NodeBehavior {
     Byz2,   // Forwards a fake block body with a wrong hash
     Byz3,   // PRBC: sends its own batch to only 2f+1 peers (batch counterpart of Byz1)
     Byz4,   // PRBC: never answers vertex or batch recovery requests
+    Byz5,   // PRBC: Byz1, and its votes too go to only 2f+1 peers (tests certificate fetch)
 }
 
 impl Default for NodeBehavior {
@@ -24,6 +25,7 @@ impl<'de> serde::Deserialize<'de> for NodeBehavior {
             "byz2"   => Ok(NodeBehavior::Byz2),
             "byz3"   => Ok(NodeBehavior::Byz3),
             "byz4"   => Ok(NodeBehavior::Byz4),
+            "byz5"   => Ok(NodeBehavior::Byz5),
             _        => Ok(NodeBehavior::Ok),
         }
     }

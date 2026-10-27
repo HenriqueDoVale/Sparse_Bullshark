@@ -36,6 +36,7 @@ async fn main() {
                 NodeBehavior::Byz2   => ("BYZ2",   "Byzantine: forwards fake payload (wrong body, original hash)"),
                 NodeBehavior::Byz3   => ("BYZ3",   "Byzantine: sends its batch to only 2f+1 peers (PRBC)"),
                 NodeBehavior::Byz4   => ("BYZ4",   "Byzantine: never answers recovery requests (PRBC)"),
+                NodeBehavior::Byz5   => ("BYZ5",   "Byzantine: proposal and votes to only 2f+1 peers (PRBC)"),
             };
             println!("\n\
                 ╔══════════════════════════════════════════════════════╗\n\

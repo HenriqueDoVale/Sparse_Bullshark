@@ -26,11 +26,13 @@ use crate::{
         broadcast::generate_nonce,
         message::TimeoutMessage,
         prbc_message::{
-            PRBCBatchMessage, PRBCBatchRequestMessage, PRBCMessage, PRBCProposeMessage,
+            no_vote_signing_bytes, propose_signing_bytes, vote_signing_bytes,
+            PRBCBatchMessage, PRBCBatchRequestMessage, PRBCCertRequestMessage,
+            PRBCCertificateMessage, PRBCMessage, PRBCNoVoteMessage, PRBCProposeMessage,
             PRBCRecoveryMessage, PRBCRecoveryRespMessage, PRBCVoteMessage,
         },
     },
-    types::vertex::{NodeId, TimeoutCertificate, Vertex, VertexHash},
+    types::vertex::{NodeId, NoVoteCertificate, TimeoutCertificate, Vertex, VertexHash},
     utils::metrics::ResourceMeter,
 };
 
@@ -102,6 +104,40 @@ fn compute_sample_for_nodes(
     scored.iter().take(sample_size).map(|(_, id)| *id).collect()
 }
 
+/// Check every signature a message carries; false means drop it. Votes,
+/// proposals and no-votes must be signed by their voter / source. Certificate
+/// votes that fail are removed, and the consensus loop then requires 2f+1 left.
+fn verify_signatures(message: &mut PRBCMessage, keys: &HashMap<NodeId, PublicKey>) -> bool {
+    let valid = |node: &NodeId, bytes: &[u8], signature: &[u8]| {
+        keys.get(node).map_or(false, |pk| {
+            Signature::from_bytes(signature).map_or(false, |sig| pk.verify(bytes, &sig).is_ok())
+        })
+    };
+    match message {
+        PRBCMessage::PRBCVote(vote) => valid(
+            &vote.voter,
+            &vote_signing_bytes(vote.round, vote.source, &vote.hash),
+            &vote.signature,
+        ),
+        PRBCMessage::PRBCPropose(propose) => valid(
+            &propose.vertex.source,
+            &propose_signing_bytes(&propose.vertex.hash),
+            &propose.signature,
+        ),
+        PRBCMessage::NoVote(no_vote) => valid(
+            &no_vote.voter,
+            &no_vote_signing_bytes(no_vote.round),
+            &no_vote.signature,
+        ),
+        PRBCMessage::Certificate(certificate) => {
+            let bytes = vote_signing_bytes(certificate.round, certificate.source, &certificate.hash);
+            certificate.votes.retain(|voter, signature| valid(voter, &bytes, signature));
+            true
+        }
+        _ => true,
+    }
+}
+
 // Dispatcher routing tag.
 #[derive(Debug)]
 enum DispatchTarget {
@@ -164,8 +200,35 @@ mod traffic_plane_tests {
                 TrafficPlane::Dissemination,
             ),
             (
-                PRBCMessage::PRBCPropose(PRBCProposeMessage { vertex: vertex() }),
+                PRBCMessage::PRBCPropose(PRBCProposeMessage {
+                    vertex: vertex(),
+                    signature: vec![],
+                }),
                 TrafficPlane::ConsensusData,
+            ),
+            (
+                PRBCMessage::Certificate(PRBCCertificateMessage {
+                    round: 1,
+                    source: 0,
+                    hash: digest.clone(),
+                    votes: BTreeMap::new(),
+                }),
+                TrafficPlane::ConsensusData,
+            ),
+            (
+                PRBCMessage::CertRequest(PRBCCertRequestMessage {
+                    hash: digest.clone(),
+                    requester: 1,
+                }),
+                TrafficPlane::Control,
+            ),
+            (
+                PRBCMessage::NoVote(PRBCNoVoteMessage {
+                    round: 1,
+                    voter: 1,
+                    signature: vec![],
+                }),
+                TrafficPlane::Control,
             ),
             (
                 PRBCMessage::PRBCRecoveryResp(PRBCRecoveryRespMessage { vertex: vertex() }),
@@ -261,12 +324,14 @@ impl TrafficPlane {
     fn for_message(message: &PRBCMessage) -> Self {
         match message {
             PRBCMessage::Batch(_) | PRBCMessage::BatchResp(_) => Self::Dissemination,
-            PRBCMessage::PRBCPropose(_) | PRBCMessage::PRBCRecoveryResp(_) => {
-                Self::ConsensusData
-            }
+            PRBCMessage::PRBCPropose(_)
+            | PRBCMessage::PRBCRecoveryResp(_)
+            | PRBCMessage::Certificate(_) => Self::ConsensusData,
             PRBCMessage::PRBCVote(_)
             | PRBCMessage::PRBCRecovery(_)
             | PRBCMessage::BatchRequest(_)
+            | PRBCMessage::CertRequest(_)
+            | PRBCMessage::NoVote(_)
             | PRBCMessage::Timeout(_) => Self::Control,
         }
     }
@@ -387,6 +452,38 @@ impl RecoveryState {
     }
 }
 
+// ── Certificate fetch ────────────────────────────────────────────────────────
+// A hash seen as a parent (of a vertex to vote on, or in a history to order)
+// that this process has not certified. The first request goes to `hints` (who
+// referenced it) after RECOVERY_TIMEOUT_MS, since the votes are normally still
+// in flight; later ones go to everyone, with a doubling wait.
+struct CertWant {
+    // Round of the vertex that referenced the hash. A certified vertex's
+    // parents lie within the GC window below it, so this bounds the search.
+    child_round: u64,
+    hints: Vec<NodeId>,
+    attempts: u32,
+    next_request_at: Instant,
+}
+
+// A received proposal: (sender, vertex, source signature).
+type PendingPropose = (NodeId, Vertex, Vec<u8>);
+
+// The edges of every vertex body this process holds, whether or not it has
+// voted for it or holds its batch. Ordering needs only these, not the batch.
+struct VertexEdges {
+    round: u64,
+    strong: Vec<VertexHash>,
+    weak: Vec<VertexHash>,
+}
+
+/// Whether a correct process may vote for a vertex (see check_parents).
+enum ParentCheck {
+    Ready,
+    Missing(Vec<VertexHash>),
+    Invalid(&'static str),
+}
+
 // ── Main struct ───────────────────────────────────────────────────────────────
 pub struct PRBCSailfish {
     environment: Environment,
@@ -401,7 +498,7 @@ pub struct PRBCSailfish {
     batch_store: BatchStore,
     // Proposals received before their referenced batch are held here and do
     // not receive a PRBC vote until the batch arrives.
-    pending_on_batch: HashMap<BatchDigest, Vec<(NodeId, Vertex)>>,
+    pending_on_batch: HashMap<BatchDigest, Vec<PendingPropose>>,
     // Prevent duplicate S1 relays when the same batch reaches an S1 member by
     // more than one best-effort path.
     forwarded_batches: HashSet<BatchDigest>,
@@ -427,12 +524,26 @@ pub struct PRBCSailfish {
     hash_committed_by_round: HashMap<u64, HashSet<NodeId>>,
     // rounds for which the designated leader is hash-committed (suppresses timeout)
     timeout_suspended: HashSet<u64>,
+    // Reverse of hash_committed: certified hash → its slot.
+    certified_slot: HashMap<VertexHash, (u64, NodeId)>,
+    // Proposals with batch present whose parents are not all certified here
+    // yet: a correct process votes only once every parent is certified.
+    parked_on_parents: HashMap<VertexHash, PendingPropose>,
+    // missing parent → proposals waiting for it
+    parent_waiters: HashMap<VertexHash, Vec<VertexHash>>,
+    // Parked proposals whose parents arrived, re-run by drain_released_proposals.
+    released_proposals: Vec<PendingPropose>,
+    cert_wanted: HashMap<VertexHash, CertWant>,
+    // round r → no-votes from processes whose round-(r+1) vertex skips leader(r)
+    no_votes: HashMap<u64, BTreeMap<NodeId, Vec<u8>>>,
 
     // ── PRBC data plane ──────────────────────────────────────────────────────
     // full Vertex bodies received via PRBCPropose or Phase 3 recovery
     prbc_payloads: HashMap<VertexHash, Vertex>,
     // vertex_hash → edges; HashSet gives O(1) contains() in the commit rule
     known_edges: HashMap<VertexHash, HashSet<VertexHash>>,
+    // Edges of every vertex body held (see VertexEdges); used for ordering.
+    vertex_edges: HashMap<VertexHash, VertexEdges>,
     // hashes whose payload has been locally verified
     execution_ready: HashSet<VertexHash>,
     // consensus-committed vertices that still await payload delivery
@@ -478,6 +589,13 @@ pub struct PRBCSailfish {
     batch_responses_served: usize,    // BatchResp this node sent to answer a peer
     recovery_restarts: usize,         // full passes over the voters with no valid answer
     recoveries_abandoned: usize,      // dropped because the round left the retention window
+    parent_waits: usize,              // proposals parked until their parents were certified here
+    cert_requests_sent: usize,        // CertRequest messages put on the wire (one per target)
+    cert_responses_ok: usize,         // valid certificates applied locally
+    cert_responses_served: usize,     // certificates this node sent to answer a peer
+    leaders_skipped: usize,           // leaders ordered as skipped (no path from the next anchor)
+    no_votes_sent: usize,             // no-votes sent to the next leader
+    invalid_vertices: usize,          // proposals that break the vertex rules (never voted)
     network_traffic: Arc<NetworkTrafficStats>,
     network_limit_mbps: Option<f64>,
     consensus_network_percent: f64,
@@ -555,9 +673,16 @@ impl PRBCSailfish {
             hash_committed: HashMap::new(),
             hash_committed_by_round: HashMap::new(),
             timeout_suspended: HashSet::new(),
+            certified_slot: HashMap::new(),
+            parked_on_parents: HashMap::new(),
+            parent_waiters: HashMap::new(),
+            released_proposals: Vec::new(),
+            cert_wanted: HashMap::new(),
+            no_votes: HashMap::new(),
 
             prbc_payloads: HashMap::new(),
             known_edges: HashMap::new(),
+            vertex_edges: HashMap::new(),
             execution_ready: HashSet::new(),
             execution_pending: HashSet::new(),
             recovery_state: HashMap::new(),
@@ -589,6 +714,13 @@ impl PRBCSailfish {
             batch_responses_served: 0,
             recovery_restarts: 0,
             recoveries_abandoned: 0,
+            parent_waits: 0,
+            cert_requests_sent: 0,
+            cert_responses_ok: 0,
+            cert_responses_served: 0,
+            leaders_skipped: 0,
+            no_votes_sent: 0,
+            invalid_vertices: 0,
             network_traffic: Arc::new(NetworkTrafficStats::default()),
             network_limit_mbps,
             consensus_network_percent,
@@ -614,6 +746,35 @@ impl PRBCSailfish {
 
     fn quorum(&self) -> usize {
         if self.reduced_quorum { self.f + 1 } else { 2 * self.f + 1 }
+    }
+
+    fn leader_of(&self, round: u64) -> NodeId {
+        (round % self.environment.nodes.len() as u64) as NodeId
+    }
+
+    /// How far below a vertex its weak edges may reach (Narwhal's gc_depth).
+    /// Keeping every reference inside this window keeps every certificate a
+    /// process may need still held by its voters.
+    fn gc_depth(&self) -> u64 {
+        self.retention_rounds.max(DAG_PRUNE_DEPTH)
+    }
+
+    /// The 2f+1 lowest-ID peers: who Byz1/Byz3/Byz5 still send to.
+    fn lowest_peers(&self) -> Vec<NodeId> {
+        let my_id = self.environment.my_node.id;
+        self.environment.nodes.iter()
+            .map(|node| node.id)
+            .filter(|&id| id != my_id)
+            .take(2 * self.f + 1)
+            .collect()
+    }
+
+    fn sign(&self, bytes: &[u8]) -> Vec<u8> {
+        if self.sign_votes {
+            self.private_key.sign(bytes).to_bytes().to_vec()
+        } else {
+            vec![]
+        }
     }
 
     fn try_next_batch(&mut self) -> Option<(Vec<u8>, Instant)> {
@@ -670,39 +831,64 @@ impl PRBCSailfish {
                         return;
                     };
                     let new_vertex = self.create_new_vertex(self.round, block);
+                    let signature = self.sign(&propose_signing_bytes(&new_vertex.hash));
                     self.vertex_timestamps.entry(new_vertex.hash.clone()).or_insert_with(Instant::now);
                     self.e2e_timestamps.insert(new_vertex.hash.clone(), batch_time);
                     self.dag.insert(new_vertex.clone());
+
+                    // Sailfish: a vertex that does not point to the previous
+                    // leader is announced to the next leader as a no-vote.
+                    let prev_round = self.round - 1;
+                    let next_leader = self.leader_of(self.round);
+                    if prev_round > 0
+                        && next_leader != my_id
+                        && !self.has_leader_hash_committed(prev_round)
+                    {
+                        let no_vote = PRBCNoVoteMessage {
+                            round: prev_round,
+                            voter: my_id,
+                            signature: self.sign(&no_vote_signing_bytes(prev_round)),
+                        };
+                        let _ = dispatcher_tx
+                            .send((DispatchTarget::One(next_leader), PRBCMessage::NoVote(no_vote)))
+                            .await;
+                        self.no_votes_sent += 1;
+                    }
+
                     self.round += 1;
                     self.round_start_time = Instant::now();
                     self.timeout_sent = false;
                     self.current_round_tc = None;
 
-                    if self.environment.my_node.behavior == NodeBehavior::Byz1 {
+                    if matches!(
+                        self.environment.my_node.behavior,
+                        NodeBehavior::Byz1 | NodeBehavior::Byz5
+                    ) {
                         // Byz1: send PRBCPropose to only 2f+1 peers via unicast.
-                        let quorum = 2 * self.f + 1;
-                        let peers: Vec<NodeId> = self.environment.nodes.iter()
-                            .map(|n| n.id)
-                            .filter(|&id| id != my_id)
-                            .take(quorum)
-                            .collect();
+                        let peers = self.lowest_peers();
                         warn!("[Node {}] BYZ1: PRBCPropose to only {}/{} peers",
                             my_id, peers.len(), self.environment.nodes.len() - 1);
                         for target in peers {
                             let _ = dispatcher_tx.send((
                                 DispatchTarget::One(target),
-                                PRBCMessage::PRBCPropose(PRBCProposeMessage { vertex: new_vertex.clone() }),
+                                PRBCMessage::PRBCPropose(PRBCProposeMessage {
+                                    vertex: new_vertex.clone(),
+                                    signature: signature.clone(),
+                                }),
                             )).await;
                         }
                     } else {
                         // Ok / Byz2: broadcast normally (byz2 attack fires in S1→S2 forwarding).
                         self.broadcast(
-                            PRBCMessage::PRBCPropose(PRBCProposeMessage { vertex: new_vertex.clone() }),
+                            PRBCMessage::PRBCPropose(PRBCProposeMessage {
+                                vertex: new_vertex.clone(),
+                                signature: signature.clone(),
+                            }),
                             dispatcher_tx,
                         ).await;
                     }
 
-                    self.handle_prbc_propose(my_id, new_vertex, dispatcher_tx).await;
+                    self.handle_prbc_propose(my_id, new_vertex, signature, dispatcher_tx).await;
                 }
             }
         }
@@ -738,8 +924,29 @@ impl PRBCSailfish {
         // 3. Do we have a Timeout Certificate for prev_round?
         let has_tc = self.current_round_tc.is_some();
 
-        if has_leader || has_tc {
+        if has_leader {
             return true;
+        }
+        if has_tc {
+            // Sailfish: the leader of this round must point to the previous
+            // leader or carry a no-vote certificate (2f+1 processes whose
+            // vertex skips it, so nobody can have committed it directly).
+            let my_id = self.environment.my_node.id;
+            if self.leader_of(self.round) != my_id {
+                return true;
+            }
+            if !self.no_votes.get(&prev_round).map_or(false, |v| v.contains_key(&my_id)) {
+                let signature = self.sign(&no_vote_signing_bytes(prev_round));
+                self.no_votes.entry(prev_round).or_default().insert(my_id, signature);
+            }
+            if self.no_votes[&prev_round].len() >= quorum {
+                return true;
+            }
+            debug!(
+                "[Node {}] Round {} leader waiting for a no-vote certificate for round {}",
+                my_id, self.round, prev_round
+            );
+            return false;
         }
 
         debug!(
@@ -841,11 +1048,14 @@ impl PRBCSailfish {
             }
         }
 
-        // Any hash-committed hash at round < r-1 not reachable through the chain.
+        // Any hash-committed hash at round < r-1 not reachable through the
+        // chain, within the GC window (the vote rule rejects older ones).
+        let gc_depth = self.gc_depth();
         let mut weak: Vec<VertexHash> = self.hash_committed.iter()
             .filter(|((r, _), h)| {
                 *r + 1 < round
                     && *r > 0
+                    && *r + gc_depth >= round
                     && !reachable.contains(*h)
                     && !self.already_ordered.contains(*h)
                     && self.dag.vertices.contains_key(*h)
@@ -878,18 +1088,26 @@ impl PRBCSailfish {
         } else {
             None
         };
+        // A leader that skips the previous leader carries the no-vote
+        // certificate it waited for in may_advance_round.
+        let source = self.environment.my_node.id;
+        let nvc = (self.leader_of(round) == source && !self.has_leader_hash_committed(prev_round))
+            .then(|| NoVoteCertificate {
+                round: prev_round,
+                signatures: self.no_votes.get(&prev_round).cloned().unwrap_or_default(),
+            });
 
         let mut v = Vertex {
             hash: vec![],
             round,
-            source: self.environment.my_node.id,
+            source,
             block,
             edges,
             weak_edges,
             signed_round: vec![],
             sample_proof: vec![],
             tc,
-            nvc: None,
+            nvc,
         };
         v.hash = v.calculate_hash();
 
@@ -920,6 +1138,16 @@ impl PRBCSailfish {
         );
         self.hash_committed.insert((round, source), hash.clone());
         self.hash_committed_by_round.entry(round).or_default().insert(source);
+        self.certified_slot.insert(hash.clone(), (round, source));
+        self.cert_wanted.remove(&hash);
+        // Proposals that were waiting for this parent can be checked again.
+        if let Some(children) = self.parent_waiters.remove(&hash) {
+            for child in children {
+                if let Some(pending) = self.parked_on_parents.remove(&child) {
+                    self.released_proposals.push(pending);
+                }
+            }
+        }
 
         // Hash Override: if this is the round leader, suspend the timeout timer.
         let leader_id = (round % self.environment.nodes.len() as u64) as NodeId;
@@ -952,6 +1180,10 @@ impl PRBCSailfish {
         // If we already have the payload, mark execution-ready immediately (move, no clone).
         if let Some(full_vertex) = self.prbc_payloads.remove(&hash) {
             self.on_execution_ready(hash.clone(), full_vertex, dispatcher_tx).await;
+        } else if let Some((_, full_vertex, _)) = self.parked_on_parents.remove(&hash) {
+            // Vertex and batch are here; we were only holding back our vote
+            // until its parents were certified. A certified vertex needs none.
+            self.on_execution_ready(hash.clone(), full_vertex, dispatcher_tx).await;
         } else if source != self.environment.my_node.id {
             // Hash-quorum before local payload. Arm a recovery state machine;
             // on_execution_ready cancels it the moment the propose/batch lands,
@@ -963,7 +1195,7 @@ impl PRBCSailfish {
             let parked_digest = self
                 .pending_on_batch
                 .iter()
-                .find(|(_, waiters)| waiters.iter().any(|(_, v)| v.hash == hash))
+                .find(|(_, waiters)| waiters.iter().any(|(_, v, _)| v.hash == hash))
                 .map(|(digest, _)| digest.clone());
             self.start_recovery(round, hash.clone(), vote_list, parked_digest);
         }
@@ -1024,60 +1256,146 @@ impl PRBCSailfish {
 
     // ── Commit logic ──────────────────────────────────────────────────────────
 
+    /// Sailfish commit rule. The latest leader with 2f+1 certified round-(r+1)
+    /// vertices pointing to it is committed directly: the anchor. Walking back
+    /// from it, each earlier leader with a strong path from the last leader
+    /// kept is ordered before it; any other leader is skipped. A leader
+    /// committed directly anywhere has a strong path from every later leader
+    /// (quorum intersection, and for the very next leader the no-vote rule),
+    /// so every correct process orders the same leaders, and a crashed leader
+    /// no longer stops ordering.
     fn try_committing_prbc(&mut self) {
         let start_round = self.round.saturating_sub(1);
         let end_round = self.last_ordered_round;
 
-        for r in (end_round + 1)..=start_round {
-            let leader_id = (r % self.environment.nodes.len() as u64) as NodeId;
-
-            // Leader must be hash-committed so we know which hash to look for.
-            let leader_hash = match self.hash_committed.get(&(r, leader_id)).cloned() {
-                Some(h) => h,
-                None => break,
+        let mut anchor = None;
+        for r in ((end_round + 1)..=start_round).rev() {
+            let Some(leader_hash) = self.hash_committed.get(&(r, self.leader_of(r))).cloned()
+            else {
+                continue;
             };
-
-            // Count round-(r+1) vertices whose known edges include leader_hash.
-            // Uses the per-round index for O(n_per_round) instead of O(total) scan.
-            let next_round = r + 1;
-            let votes = self
-                .hash_committed_by_round
-                .get(&next_round)
-                .map_or(0, |sources| {
-                    sources.iter().filter(|&&src| {
-                        self.hash_committed
-                            .get(&(next_round, src))
-                            .and_then(|h| self.known_edges.get(h))
-                            .map_or(false, |edges| edges.contains(&leader_hash))
-                    }).count()
-                });
-
-            if votes >= self.quorum() {
-                if !self.already_ordered.contains(&leader_hash) {
-                    if self.dag.vertices.contains_key(&leader_hash) {
-                        self.commit_causal_history_prbc(leader_hash.clone());
-                        self.last_ordered_round = r;
-                        let pruned = self.dag.prune_ordered(
-                            self.last_ordered_round.saturating_sub(DAG_PRUNE_DEPTH),
-                            &self.already_ordered,
-                        );
-                        if self.retention_rounds > 0 {
-                            for vertex in pruned {
-                                // Skeletons (payload never arrived) cannot
-                                // answer a recovery request.
-                                if self.execution_ready.contains(&vertex.hash) {
-                                    self.retained_vertices
-                                        .insert(vertex.round, vertex.hash.clone(), vertex);
-                                }
-                            }
-                        }
-                        self.prune_prbc_caches();
-                    }
-                }
-            } else {
+            if self.direct_support(r, &leader_hash) >= self.quorum() {
+                anchor = Some((r, leader_hash));
                 break;
             }
         }
+        let Some((anchor_round, anchor_hash)) = anchor else {
+            return;
+        };
+
+        // Never order with a gap: every vertex the anchor's unordered history
+        // reaches must be certified here and its edges known.
+        if !self.history_complete(&anchor_hash) {
+            return;
+        }
+
+        let mut chain = vec![anchor_hash.clone()];
+        let mut current = anchor_hash;
+        for r in ((end_round + 1)..anchor_round).rev() {
+            let Some(leader_hash) = self.hash_committed.get(&(r, self.leader_of(r))).cloned()
+            else {
+                continue;
+            };
+            if self.strong_path(&current, &leader_hash, r) {
+                chain.push(leader_hash.clone());
+                current = leader_hash;
+            }
+        }
+        self.leaders_skipped += (anchor_round - end_round) as usize - chain.len();
+
+        for leader_hash in chain.into_iter().rev() {
+            self.commit_causal_history_prbc(leader_hash);
+        }
+        self.last_ordered_round = anchor_round;
+        let pruned = self.dag.prune_ordered(
+            self.last_ordered_round.saturating_sub(DAG_PRUNE_DEPTH),
+            &self.already_ordered,
+        );
+        if self.retention_rounds > 0 {
+            for vertex in pruned {
+                // Skeletons (payload never arrived) cannot
+                // answer a recovery request.
+                if self.execution_ready.contains(&vertex.hash) {
+                    self.retained_vertices
+                        .insert(vertex.round, vertex.hash.clone(), vertex);
+                }
+            }
+        }
+        self.prune_prbc_caches();
+    }
+
+    /// Certified round-(r+1) vertices whose strong edges include the leader of r.
+    fn direct_support(&self, round: u64, leader_hash: &VertexHash) -> usize {
+        let next_round = round + 1;
+        self.hash_committed_by_round
+            .get(&next_round)
+            .map_or(0, |sources| {
+                sources.iter().filter(|&&src| {
+                    self.hash_committed
+                        .get(&(next_round, src))
+                        .and_then(|h| self.known_edges.get(h))
+                        .map_or(false, |edges| edges.contains(leader_hash))
+                }).count()
+            })
+    }
+
+    /// True if every vertex in the unordered causal history of `anchor` is
+    /// certified here and its edges are known. Asks for the certificate of
+    /// any hash not certified here; a certified vertex whose body is missing
+    /// is already being recovered (armed in on_hash_quorum).
+    fn history_complete(&mut self, anchor: &VertexHash) -> bool {
+        let mut complete = true;
+        let mut seen: HashSet<VertexHash> = HashSet::new();
+        // (hash, slot of the vertex that referenced it)
+        let mut stack: Vec<(VertexHash, Option<(u64, NodeId)>)> = vec![(anchor.clone(), None)];
+        let mut wanted: Vec<(VertexHash, u64, NodeId)> = Vec::new();
+        while let Some((hash, child)) = stack.pop() {
+            if self.already_ordered.contains(&hash) || !seen.insert(hash.clone()) {
+                continue;
+            }
+            let Some(&slot) = self.certified_slot.get(&hash) else {
+                complete = false;
+                if let Some((round, source)) = child {
+                    wanted.push((hash, round, source));
+                }
+                continue;
+            };
+            let Some(edges) = self.vertex_edges.get(&hash) else {
+                complete = false;
+                continue;
+            };
+            for parent in edges.strong.iter().chain(edges.weak.iter()) {
+                stack.push((parent.clone(), Some(slot)));
+            }
+        }
+        for (hash, round, source) in wanted {
+            self.want_certificate(hash, round, vec![source]);
+        }
+        complete
+    }
+
+    /// Is there a path from `from` down to `to` (a vertex of round `to_round`)
+    /// along strong edges only?
+    fn strong_path(&self, from: &VertexHash, to: &VertexHash, to_round: u64) -> bool {
+        let mut seen: HashSet<&VertexHash> = HashSet::new();
+        let mut stack = vec![from];
+        while let Some(hash) = stack.pop() {
+            if hash == to {
+                return true;
+            }
+            if !seen.insert(hash) {
+                continue;
+            }
+            let Some(edges) = self.vertex_edges.get(hash) else {
+                continue;
+            };
+            if edges.round > to_round + 1 {
+                stack.extend(edges.strong.iter());
+            } else if edges.round == to_round + 1 && edges.strong.contains(to) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Prune payload and vote caches for rounds that are too old to need recovery.
@@ -1100,27 +1418,51 @@ impl PRBCSailfish {
             .retain(|round, _| *round == 0 || *round >= cutoff);
         self.timeout_store.retain(|round, _| *round >= cutoff);
         self.timeout_suspended.retain(|round| *round >= cutoff);
+        self.vertex_edges.retain(|_, edges| edges.round >= cutoff);
+        self.no_votes.retain(|round, _| *round >= cutoff);
 
         // Retention window. Nothing older can still be served by a correct
         // peer, so recovery for it is dropped: a process that far behind
         // needs state transfer, which is out of scope.
-        let horizon = self
-            .last_ordered_round
-            .saturating_sub(self.retention_rounds.max(DAG_PRUNE_DEPTH));
+        let horizon = self.last_ordered_round.saturating_sub(self.gc_depth());
         self.retained_vertices.prune_below(horizon);
         self.retained_batches.prune_below(horizon);
         let before = self.recovery_state.len();
         self.recovery_state.retain(|_, state| state.round >= horizon);
         self.recoveries_abandoned += before - self.recovery_state.len();
+        self.cert_wanted.retain(|_, want| want.child_round >= horizon);
+        self.parked_on_parents.retain(|_, (_, vertex, _)| vertex.round >= horizon);
+        let parked = &self.parked_on_parents;
+        self.parent_waiters.retain(|_, children| {
+            children.retain(|child| parked.contains_key(child));
+            !children.is_empty()
+        });
     }
 
+    /// Order the unordered causal history of `leader_hash` (strong and weak
+    /// edges), sorted by (round, source) so every process orders it the same.
     fn commit_causal_history_prbc(&mut self, leader_hash: VertexHash) {
+        let mut history: Vec<(u64, NodeId, VertexHash)> = Vec::new();
+        let mut seen: HashSet<VertexHash> = HashSet::new();
         let mut stack = vec![leader_hash];
-
         while let Some(h) = stack.pop() {
-            if self.already_ordered.contains(&h) {
+            if self.already_ordered.contains(&h) || !seen.insert(h.clone()) {
                 continue;
             }
+            // history_complete checked that every vertex here is certified
+            // and its edges known.
+            let Some(&(round, source)) = self.certified_slot.get(&h) else {
+                continue;
+            };
+            if let Some(edges) = self.vertex_edges.get(&h) {
+                stack.extend(edges.strong.iter().cloned());
+                stack.extend(edges.weak.iter().cloned());
+            }
+            history.push((round, source, h));
+        }
+        history.sort();
+
+        for (_, _, h) in history {
             self.already_ordered.insert(h.clone());
             self.consensus_committed_count += 1;
             if let Some(ts) = self.vertex_timestamps.remove(&h) {
@@ -1137,38 +1479,20 @@ impl PRBCSailfish {
                 self.finalized_block_count += 1;
                 self.retire_batch(&h);
             } else {
-                self.execution_pending.insert(h.clone());
-            }
-
-            // Traverse strong parents (via known_edges) and weak parents.
-            // Clone only lightweight hash vecs — no 256KB Vertex copies on the stack.
-            let round = self.dag.vertices.get(&h).map(|v| v.round).unwrap_or(0);
-            if round > 0 {
-                let strong: Vec<VertexHash> = self.known_edges
-                    .get(&h)
-                    .map(|s| s.iter().cloned().collect())
-                    .unwrap_or_default();
-                let weak: Vec<VertexHash> = self.dag.vertices
-                    .get(&h)
-                    .map(|v| v.weak_edges.clone())
-                    .unwrap_or_default();
-                for parent_hash in strong.into_iter().chain(weak.into_iter()) {
-                    if !self.already_ordered.contains(&parent_hash)
-                        && self.dag.vertices.contains_key(&parent_hash)
-                    {
-                        stack.push(parent_hash);
-                    }
-                }
+                self.execution_pending.insert(h);
             }
         }
     }
 
     // ── PRBC message handlers ─────────────────────────────────────────────────
 
+    /// `signature` is the source's signature over the vertex, checked on the
+    /// reader task when signatures are on; it is forwarded on S1→S2 relays.
     async fn handle_prbc_propose(
         &mut self,
         sender: NodeId,
         vertex: Vertex,
+        signature: Vec<u8>,
         dispatcher_tx: &MessageDispatcher,
     ) {
         let hash = vertex.hash.clone();
@@ -1177,7 +1501,10 @@ impl PRBCSailfish {
         let v_source = vertex.source;
 
         // Payload already stored or fully execution-ready — nothing to do.
-        if self.prbc_payloads.contains_key(&hash) || self.execution_ready.contains(&hash) {
+        if self.prbc_payloads.contains_key(&hash)
+            || self.execution_ready.contains(&hash)
+            || self.parked_on_parents.contains_key(&hash)
+        {
             return;
         }
 
@@ -1205,6 +1532,9 @@ impl PRBCSailfish {
             );
             return;
         }
+        // The hash covers the edges, so they are authentic for this hash
+        // whether or not this process ever votes for it.
+        self.record_vertex_edges(&vertex);
         let digest = vertex.block.clone();
         if !self.batch_store.contains(&digest) {
             // If this vertex was being recovered, only its batch is missing now.
@@ -1215,8 +1545,8 @@ impl PRBCSailfish {
                 }
             }
             let waiters = self.pending_on_batch.entry(digest).or_default();
-            if !waiters.iter().any(|(_, pending)| pending.hash == hash) {
-                waiters.push((sender, vertex));
+            if !waiters.iter().any(|(_, pending, _)| pending.hash == hash) {
+                waiters.push((sender, vertex, signature));
             }
             return;
         }
@@ -1233,6 +1563,34 @@ impl PRBCSailfish {
             self.payload_post_quorum_count += 1;
             self.on_execution_ready(hash, vertex, dispatcher_tx).await;
             return;
+        }
+
+        // Vote only for a well-formed vertex whose parents are all certified
+        // here. Then every certified vertex has f+1 correct voters holding
+        // its parents' certificates, so any process can fetch them.
+        match self.check_parents(&vertex) {
+            ParentCheck::Ready => {}
+            ParentCheck::Invalid(reason) => {
+                self.invalid_vertices += 1;
+                warn!(
+                    "[Node {}] PRBCPropose round={} source={}: {}, not voting",
+                    self.environment.my_node.id, v_round, v_source, reason
+                );
+                return;
+            }
+            ParentCheck::Missing(parents) => {
+                self.parent_waits += 1;
+                let mut hints = vec![sender];
+                if v_source != sender {
+                    hints.push(v_source);
+                }
+                for parent in parents {
+                    self.parent_waiters.entry(parent.clone()).or_default().push(hash.clone());
+                    self.want_certificate(parent, v_round, hints.clone());
+                }
+                self.parked_on_parents.insert(hash, (sender, vertex, signature));
+                return;
+            }
         }
 
         if let Some(voted_hash) = self.voted_hashes.get(&(v_round, v_source)) {
@@ -1285,20 +1643,23 @@ impl PRBCSailfish {
             let _ = dispatcher_tx
                 .send((
                     DispatchTarget::Many(targets),
-                    PRBCMessage::PRBCPropose(PRBCProposeMessage { vertex: fwd }),
+                    PRBCMessage::PRBCPropose(PRBCProposeMessage { vertex: fwd, signature }),
                 ))
                 .await;
         }
 
-        // Broadcast vote. When sign_votes is on, include an Ed25519 sig over the hash.
-        let my_sig = if self.sign_votes {
-            self.private_key.sign(&hash).to_bytes().to_vec()
+        // Broadcast vote. When sign_votes is on, include an Ed25519 sig over
+        // the hash bound to its slot.
+        let my_sig = self.sign(&vote_signing_bytes(v_round, v_source, &hash));
+        // Byz5 withholds its votes from the highest-ID nodes as well.
+        let vote_target = if self.environment.my_node.behavior == NodeBehavior::Byz5 {
+            DispatchTarget::Many(self.lowest_peers())
         } else {
-            vec![]
+            DispatchTarget::All
         };
         let _ = dispatcher_tx
             .send((
-                DispatchTarget::All,
+                vote_target,
                 PRBCMessage::PRBCVote(PRBCVoteMessage {
                     round: v_round,
                     source: v_source,
@@ -1397,8 +1758,8 @@ impl PRBCSailfish {
         }
 
         if let Some(waiters) = self.pending_on_batch.remove(&digest) {
-            for (sender, vertex) in waiters {
-                self.handle_prbc_propose(sender, vertex, dispatcher_tx).await;
+            for (sender, vertex, signature) in waiters {
+                self.handle_prbc_propose(sender, vertex, signature, dispatcher_tx).await;
             }
         }
     }
@@ -1536,18 +1897,20 @@ impl PRBCSailfish {
         }
 
         self.recovery_responses_ok += 1;
+        self.record_vertex_edges(&msg.vertex);
 
         let digest = msg.vertex.block.clone();
         if !self.batch_store.contains(&digest) {
             // Vertex recovered, batch not here. Park the vertex as a propose
-            // would be, and ask the same voters for the batch.
+            // would be, and ask the same voters for the batch. It is
+            // certified, so it is never voted on and needs no signature.
             let wait = Duration::from_millis(self.recovery_timeout_ms as u64);
             if let Some(state) = self.recovery_state.get_mut(&hash) {
                 state.switch_to_batch(digest.clone(), wait);
             }
             let waiters = self.pending_on_batch.entry(digest).or_default();
-            if !waiters.iter().any(|(_, pending)| pending.hash == hash) {
-                waiters.push((sender, msg.vertex));
+            if !waiters.iter().any(|(_, pending, _)| pending.hash == hash) {
+                waiters.push((sender, msg.vertex, vec![]));
             }
             return;
         }
@@ -1633,6 +1996,250 @@ impl PRBCSailfish {
                 state.next_request_at = Instant::now();
                 state.requested_from = None;
             }
+        }
+    }
+
+    // ── Vote rule, certificate fetch, no-votes ────────────────────────────────
+
+    fn record_vertex_edges(&mut self, vertex: &Vertex) {
+        if !self.vertex_edges.contains_key(&vertex.hash) {
+            self.vertex_edges.insert(
+                vertex.hash.clone(),
+                VertexEdges {
+                    round: vertex.round,
+                    strong: vertex.edges.clone(),
+                    weak: vertex.weak_edges.clone(),
+                },
+            );
+        }
+    }
+
+    /// The vote rule. A correct process votes for a vertex only if it is well
+    /// formed and every parent is certified here:
+    /// - round 1: its one strong edge is genesis;
+    /// - later rounds: at least 2f+1 strong edges, each a certified vertex of
+    ///   the previous round from a distinct source;
+    /// - weak edges: certified vertices more than one round below, within the
+    ///   GC window;
+    /// - the round's leader points to the previous leader or carries a valid
+    ///   no-vote certificate for it (Sailfish).
+    fn check_parents(&self, vertex: &Vertex) -> ParentCheck {
+        let round = vertex.round;
+        if round == 0 {
+            return ParentCheck::Invalid("round 0 is genesis");
+        }
+        if round == 1 {
+            let genesis = vec![0u8; 32];
+            return if vertex.edges == [genesis] && vertex.weak_edges.is_empty() {
+                ParentCheck::Ready
+            } else {
+                ParentCheck::Invalid("a round-1 vertex must point to genesis only")
+            };
+        }
+        let distinct: HashSet<&VertexHash> =
+            vertex.edges.iter().chain(vertex.weak_edges.iter()).collect();
+        if distinct.len() != vertex.edges.len() + vertex.weak_edges.len() {
+            return ParentCheck::Invalid("repeated edge");
+        }
+        if vertex.edges.len() < self.quorum() {
+            return ParentCheck::Invalid("fewer than 2f+1 strong edges");
+        }
+
+        let mut missing = Vec::new();
+        let mut sources = HashSet::new();
+        let prev_leader = self.leader_of(round - 1);
+        let mut points_to_prev_leader = false;
+        for edge in &vertex.edges {
+            match self.certified_slot.get(edge) {
+                Some(&(r, s)) if r == round - 1 && sources.insert(s) => {
+                    points_to_prev_leader |= s == prev_leader;
+                }
+                Some(_) => {
+                    return ParentCheck::Invalid("strong edge is not a distinct previous-round vertex")
+                }
+                None => missing.push(edge.clone()),
+            }
+        }
+        let gc_depth = self.gc_depth();
+        for edge in &vertex.weak_edges {
+            match self.certified_slot.get(edge) {
+                Some(&(r, _)) if r > 0 && r + 1 < round && r + gc_depth >= round => {}
+                Some(_) => return ParentCheck::Invalid("weak edge outside its window"),
+                None => missing.push(edge.clone()),
+            }
+        }
+        if !missing.is_empty() {
+            return ParentCheck::Missing(missing);
+        }
+
+        if vertex.source == self.leader_of(round)
+            && !points_to_prev_leader
+            && !self.valid_nvc(vertex.nvc.as_ref(), round - 1)
+        {
+            return ParentCheck::Invalid(
+                "leader skips the previous leader without a no-vote certificate",
+            );
+        }
+        ParentCheck::Ready
+    }
+
+    /// 2f+1 distinct processes signed that their vertex after `round` does not
+    /// point to the leader of `round`.
+    fn valid_nvc(&self, nvc: Option<&NoVoteCertificate>, round: u64) -> bool {
+        let Some(nvc) = nvc else {
+            return false;
+        };
+        if nvc.round != round || nvc.signatures.len() < self.quorum() {
+            return false;
+        }
+        let bytes = no_vote_signing_bytes(round);
+        nvc.signatures.iter().all(|(node, sig)| {
+            self.public_keys.get(node).map_or(false, |pk| {
+                !self.sign_votes
+                    || Signature::from_bytes(sig)
+                        .map_or(false, |sig| pk.verify(&bytes, &sig).is_ok())
+            })
+        })
+    }
+
+    /// Note a hash seen as a parent that is not certified here; tick_certificates
+    /// asks for its certificate if the votes do not arrive on their own.
+    fn want_certificate(&mut self, hash: VertexHash, child_round: u64, hints: Vec<NodeId>) {
+        if self.certified_slot.contains_key(&hash) {
+            return;
+        }
+        let first_request = Instant::now() + Duration::from_millis(self.recovery_timeout_ms as u64);
+        let want = self.cert_wanted.entry(hash).or_insert_with(|| CertWant {
+            child_round,
+            hints: Vec::new(),
+            attempts: 0,
+            next_request_at: first_request,
+        });
+        want.child_round = want.child_round.max(child_round);
+        for hint in hints {
+            if !want.hints.contains(&hint) {
+                want.hints.push(hint);
+            }
+        }
+    }
+
+    /// Driven from the main loop's tick, like tick_recovery. The first request
+    /// goes to one process that referenced the hash; later ones go to
+    /// everyone, since at least f+1 correct voters of any certified child
+    /// hold the certificate.
+    async fn tick_certificates(&mut self, dispatcher_tx: &MessageDispatcher) {
+        let my_id = self.environment.my_node.id;
+        let now = Instant::now();
+        let mut requests = Vec::new();
+        for (hash, want) in self.cert_wanted.iter_mut() {
+            if now < want.next_request_at {
+                continue;
+            }
+            let targets: Vec<NodeId> = if want.attempts == 0 {
+                want.hints.iter().copied().filter(|&node| node != my_id).take(1).collect()
+            } else {
+                self.environment.nodes.iter().map(|node| node.id).filter(|&node| node != my_id).collect()
+            };
+            want.attempts += 1;
+            let wait_ms = (self.recovery_timeout_ms as u64)
+                << want.attempts.min(MAX_RECOVERY_BACKOFF_SHIFT);
+            want.next_request_at = now + Duration::from_millis(wait_ms);
+            if !targets.is_empty() {
+                requests.push((hash.clone(), targets));
+            }
+        }
+        for (hash, targets) in requests {
+            self.cert_requests_sent += targets.len();
+            let request = PRBCCertRequestMessage { hash, requester: my_id };
+            let _ = dispatcher_tx
+                .send((DispatchTarget::Many(targets), PRBCMessage::CertRequest(request)))
+                .await;
+        }
+    }
+
+    async fn handle_cert_request(
+        &mut self,
+        sender: NodeId,
+        msg: PRBCCertRequestMessage,
+        dispatcher_tx: &MessageDispatcher,
+    ) {
+        // Same anti-reflection rule as vertex recovery.
+        if msg.requester != sender {
+            return;
+        }
+        if self.environment.my_node.behavior == NodeBehavior::Byz4 {
+            return;
+        }
+        let Some(&(round, source)) = self.certified_slot.get(&msg.hash) else {
+            return;
+        };
+        let Some(votes) = self.prbc_votes.get(&(round, source, msg.hash.clone())) else {
+            return;
+        };
+        if votes.len() < self.quorum() {
+            return;
+        }
+        let certificate = PRBCCertificateMessage {
+            round,
+            source,
+            hash: msg.hash,
+            votes: votes.clone(),
+        };
+        let _ = dispatcher_tx
+            .send((DispatchTarget::One(sender), PRBCMessage::Certificate(certificate)))
+            .await;
+        self.cert_responses_served += 1;
+    }
+
+    async fn handle_certificate(
+        &mut self,
+        msg: PRBCCertificateMessage,
+        dispatcher_tx: &MessageDispatcher,
+    ) {
+        if !self.cert_wanted.contains_key(&msg.hash) || self.certified_slot.contains_key(&msg.hash) {
+            return;
+        }
+        // Each vote's signature over (round, source, hash) was checked on the
+        // reader task and invalid ones dropped, so who forwarded it is irrelevant.
+        if msg.votes.len() < self.quorum()
+            || !msg.votes.keys().all(|voter| self.public_keys.contains_key(voter))
+        {
+            warn!(
+                "[Node {}] Certificate round={} source={}: fewer than 2f+1 valid votes",
+                self.environment.my_node.id, msg.round, msg.source
+            );
+            return;
+        }
+        if let Some(existing) = self.hash_committed.get(&(msg.round, msg.source)) {
+            if existing != &msg.hash {
+                warn!(
+                    "[Node {}] Certificate round={} source={}: conflicts with the one held",
+                    self.environment.my_node.id, msg.round, msg.source
+                );
+            }
+            return;
+        }
+        self.cert_responses_ok += 1;
+        self.prbc_votes
+            .insert((msg.round, msg.source, msg.hash.clone()), msg.votes.clone());
+        self.on_hash_quorum(msg.round, msg.source, msg.hash, msg.votes, dispatcher_tx)
+            .await;
+    }
+
+    fn handle_no_vote(&mut self, sender: NodeId, msg: PRBCNoVoteMessage) {
+        // The signature (checked on the reader task) lets the leader put the
+        // no-vote in a certificate; the sender must be the voter itself.
+        if msg.voter != sender {
+            return;
+        }
+        self.no_votes.entry(msg.round).or_default().insert(msg.voter, msg.signature);
+    }
+
+    /// Re-run proposals whose missing parents have since been certified. Run
+    /// from the event loop rather than from on_hash_quorum, which would recurse.
+    async fn drain_released_proposals(&mut self, dispatcher_tx: &MessageDispatcher) {
+        while let Some((sender, vertex, signature)) = self.released_proposals.pop() {
+            self.handle_prbc_propose(sender, vertex, signature, dispatcher_tx).await;
         }
     }
 
@@ -1830,6 +2437,8 @@ impl PRBCSailfish {
         // Pre-populate PRBC state so round-1 vertex creation finds genesis.
         self.hash_committed.insert((0, 0), genesis_hash.clone());
         self.hash_committed_by_round.entry(0).or_default().insert(0);
+        self.certified_slot.insert(genesis_hash.clone(), (0, 0));
+        self.record_vertex_edges(&genesis);
         self.execution_ready.insert(genesis_hash.clone());
         self.known_edges.insert(genesis_hash.clone(), HashSet::new());
         // Genesis is protocol metadata, not an executed transaction block.
@@ -2117,7 +2726,9 @@ impl PRBCSailfish {
             }
 
             self.tick_recovery(&dispatcher_tx).await;
+            self.tick_certificates(&dispatcher_tx).await;
             self.process_work_loop(&dispatcher_tx).await;
+            self.drain_released_proposals(&dispatcher_tx).await;
 
             if !control_open && !consensus_data_open && !dissemination_open {
                 break;
@@ -2137,7 +2748,7 @@ impl PRBCSailfish {
         match message {
             PRBCMessage::Batch(batch) => self.handle_batch(sender, batch, dispatcher_tx).await,
             PRBCMessage::PRBCPropose(propose) => {
-                self.handle_prbc_propose(sender, propose.vertex, dispatcher_tx)
+                self.handle_prbc_propose(sender, propose.vertex, propose.signature, dispatcher_tx)
                     .await
             }
             PRBCMessage::PRBCVote(vote) => {
@@ -2161,7 +2772,15 @@ impl PRBCSailfish {
             PRBCMessage::BatchResp(batch) => {
                 self.handle_batch_resp(sender, batch, dispatcher_tx).await
             }
+            PRBCMessage::CertRequest(request) => {
+                self.handle_cert_request(sender, request, dispatcher_tx).await
+            }
+            PRBCMessage::Certificate(certificate) => {
+                self.handle_certificate(certificate, dispatcher_tx).await
+            }
+            PRBCMessage::NoVote(no_vote) => self.handle_no_vote(sender, no_vote),
         }
+        self.drain_released_proposals(dispatcher_tx).await;
     }
 
     // Returns one TcpStream per peer for each traffic plane. Keeping control,
@@ -2365,7 +2984,7 @@ impl PRBCSailfish {
             if stream.read_exact(&mut sig_bytes).await.is_err() {
                 return;
             }
-            if let Ok(message) = deserialize::<PRBCMessage>(&buffer) {
+            if let Ok(mut message) = deserialize::<PRBCMessage>(&buffer) {
                 let expected_plane = TrafficPlane::for_message(&message);
                 if expected_plane != plane {
                     warn!(
@@ -2377,16 +2996,12 @@ impl PRBCSailfish {
                 let frame_bytes =
                     (MESSAGE_BYTES_LENGTH + length as usize + SIGNATURE_BYTES_LENGTH) as u64;
                 network_traffic.record_rx(plane, frame_bytes);
-                // Check vote signatures here, one reader task per peer, so the
+                // Check signatures here, one reader task per peer, so the
                 // checks run in parallel instead of one at a time in the
-                // consensus loop. An invalid vote is dropped, as before.
-                if let (PRBCMessage::PRBCVote(vote), Some(keys)) = (&message, &vote_keys) {
-                    let valid = keys.get(&vote.voter).map_or(false, |pk| {
-                        Signature::from_bytes(&vote.signature)
-                            .map_or(false, |sig| pk.verify(&vote.hash, &sig).is_ok())
-                    });
-                    if !valid {
-                        warn!("[Node {}] PRBC: invalid vote signature from node {}",
+                // consensus loop. An invalid message is dropped.
+                if let Some(keys) = &vote_keys {
+                    if !verify_signatures(&mut message, keys) {
+                        warn!("[Node {}] PRBC: invalid signature on a message from node {}",
                             my_id, peer_id);
                         continue;
                     }
@@ -2646,6 +3261,13 @@ impl PRBCSailfish {
         println!("  Batches cached:       {}", self.batch_store.len());
         println!("  Batches retained:     {}", self.retained_batches.len());
         println!("  Vertices retained:    {}", self.retained_vertices.len());
+        println!("  Leaders skipped:      {}", self.leaders_skipped);
+        println!("  No-votes sent:        {}", self.no_votes_sent);
+        println!("  Parent waits:         {}", self.parent_waits);
+        println!("  Cert requests sent:   {}", self.cert_requests_sent);
+        println!("  Cert resp OK:         {}", self.cert_responses_ok);
+        println!("  Cert resp served:     {}", self.cert_responses_served);
+        println!("  Invalid vertices:     {}", self.invalid_vertices);
         println!("  Control TX bytes:     {} B", control_tx);
         println!("  Control RX bytes:     {} B", control_rx);
         println!("  Consensus-data TX:    {} B", consensus_data_tx);
