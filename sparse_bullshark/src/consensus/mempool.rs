@@ -12,7 +12,7 @@
 //! node keeps the exact inline behavior, so the two can be benchmarked from the
 //! same binary.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use sha2::{Digest, Sha256};
 
 use crate::types::vertex::VertexHash;
@@ -55,12 +55,68 @@ impl BatchStore {
         self.batches.get(digest)
     }
 
-    pub fn remove(&mut self, digest: &[u8]) {
-        self.batches.remove(digest);
+    pub fn remove(&mut self, digest: &[u8]) -> Option<Vec<u8>> {
+        self.batches.remove(digest)
     }
 
     pub fn len(&self) -> usize {
         self.batches.len()
+    }
+}
+
+/// Delivered items (batches or vertices) kept for a bounded number of rounds
+/// so that peers that missed them can still fetch them. Plays the role of
+/// Narwhal's `gc_depth`. Indexed by round so pruning is a range split.
+pub struct RetentionStore<V> {
+    items: HashMap<Vec<u8>, V>,
+    by_round: BTreeMap<u64, Vec<Vec<u8>>>,
+}
+
+impl<V> RetentionStore<V> {
+    pub fn new() -> Self {
+        Self { items: HashMap::new(), by_round: BTreeMap::new() }
+    }
+
+    pub fn insert(&mut self, round: u64, key: Vec<u8>, value: V) {
+        if self.items.insert(key.clone(), value).is_none() {
+            self.by_round.entry(round).or_default().push(key);
+        }
+    }
+
+    pub fn get(&self, key: &[u8]) -> Option<&V> {
+        self.items.get(key)
+    }
+
+    /// Drop everything retained for rounds below `round`.
+    pub fn prune_below(&mut self, round: u64) {
+        let keep = self.by_round.split_off(&round);
+        for (_, keys) in std::mem::replace(&mut self.by_round, keep) {
+            for key in keys {
+                self.items.remove(&key);
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::RetentionStore;
+
+    #[test]
+    fn prunes_only_rounds_below_the_cutoff() {
+        let mut store = RetentionStore::new();
+        store.insert(3, vec![3], "a");
+        store.insert(5, vec![5], "b");
+        store.insert(5, vec![6], "c");
+        store.prune_below(5);
+        assert!(store.get(&[3]).is_none());
+        assert_eq!(store.get(&[5]), Some(&"b"));
+        assert_eq!(store.get(&[6]), Some(&"c"));
+        assert_eq!(store.len(), 2);
     }
 }
 

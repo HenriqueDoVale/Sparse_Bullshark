@@ -21,13 +21,13 @@ use tokio::{
 use shared::{domain::{environment::Environment, node::NodeBehavior}, transaction_generator::TransactionGenerator};
 use crate::{
     consensus::dag::PRBCDag,
-    consensus::mempool::{batch_digest, BatchDigest, BatchStore},
+    consensus::mempool::{batch_digest, BatchDigest, BatchStore, RetentionStore},
     network::{
         broadcast::generate_nonce,
         message::TimeoutMessage,
         prbc_message::{
-            PRBCBatchMessage, PRBCMessage, PRBCProposeMessage, PRBCRecoveryMessage,
-            PRBCRecoveryRespMessage, PRBCVoteMessage,
+            PRBCBatchMessage, PRBCBatchRequestMessage, PRBCMessage, PRBCProposeMessage,
+            PRBCRecoveryMessage, PRBCRecoveryRespMessage, PRBCVoteMessage,
         },
     },
     types::vertex::{NodeId, TimeoutCertificate, Vertex, VertexHash},
@@ -44,6 +44,17 @@ const EXECUTION_DURATION: u64 = 60;
 const CONTROL_DRAIN_BUDGET: usize = 256;
 const CONSENSUS_DATA_DRAIN_BUDGET: usize = 64;
 const DISSEMINATION_DRAIN_BUDGET: usize = 16;
+
+// ── Recovery constants ───────────────────────────────────────────────────────
+// Ordered vertices stay in the DAG for this many rounds behind the last
+// ordered round (see try_committing_prbc).
+const DAG_PRUNE_DEPTH: u64 = 4;
+// Default for RETENTION_ROUNDS: how long a delivered vertex and batch are kept
+// so peers can still fetch them. 50 matches Narwhal's default gc_depth.
+const DEFAULT_RETENTION_ROUNDS: u64 = 50;
+// After each full pass over the voters with no valid answer, the wait between
+// requests doubles, up to 2^3 = 8 x RECOVERY_TIMEOUT_MS.
+const MAX_RECOVERY_BACKOFF_SHIFT: u32 = 3;
 
 // ── Protocol constants ────────────────────────────────────────────────────────
 // Sample size = PRBC_C * sqrt(n), rounded up. Default 1.4 (ceil ≈ 4 for n=8) is
@@ -157,11 +168,22 @@ mod traffic_plane_tests {
                 TrafficPlane::ConsensusData,
             ),
             (
-                PRBCMessage::PRBCRecoveryResp(PRBCRecoveryRespMessage {
-                    vertex: vertex(),
-                    votes: BTreeMap::new(),
-                }),
+                PRBCMessage::PRBCRecoveryResp(PRBCRecoveryRespMessage { vertex: vertex() }),
                 TrafficPlane::ConsensusData,
+            ),
+            (
+                PRBCMessage::BatchRequest(PRBCBatchRequestMessage {
+                    digest: digest.clone(),
+                    requester: 1,
+                }),
+                TrafficPlane::Control,
+            ),
+            (
+                PRBCMessage::BatchResp(PRBCBatchMessage {
+                    digest: digest.clone(),
+                    payload: vec![4],
+                }),
+                TrafficPlane::Dissemination,
             ),
             (
                 PRBCMessage::PRBCVote(PRBCVoteMessage {
@@ -238,12 +260,13 @@ impl TrafficPlane {
 
     fn for_message(message: &PRBCMessage) -> Self {
         match message {
-            PRBCMessage::Batch(_) => Self::Dissemination,
+            PRBCMessage::Batch(_) | PRBCMessage::BatchResp(_) => Self::Dissemination,
             PRBCMessage::PRBCPropose(_) | PRBCMessage::PRBCRecoveryResp(_) => {
                 Self::ConsensusData
             }
             PRBCMessage::PRBCVote(_)
             | PRBCMessage::PRBCRecovery(_)
+            | PRBCMessage::BatchRequest(_)
             | PRBCMessage::Timeout(_) => Self::Control,
         }
     }
@@ -316,11 +339,52 @@ impl BandwidthPacer {
 }
 
 // ── Recovery state per in-flight hash ────────────────────────────────────────
+// What a process is still missing for a hash-committed vertex: the vertex
+// itself, or, once the vertex is known, the batch its digest names.
+#[derive(Clone, Debug, PartialEq)]
+enum RecoveryTarget {
+    Vertex,
+    Batch(BatchDigest),
+}
+
 struct RecoveryState {
+    round: u64,
+    target: RecoveryTarget,
+    // The 2f+1 voters of the hash quorum. Each stored the batch (and so held
+    // the vertex) before voting, so at least f+1 of them are correct holders.
     vote_list: Vec<NodeId>,
     next_idx: usize,
-    request_sent_at: Instant,
+    // Completed passes over vote_list without a valid answer.
+    passes: u32,
+    next_request_at: Instant,
     requested_from: Option<NodeId>,
+    // Everyone asked so far. A valid late answer from any of them is accepted.
+    asked: HashSet<NodeId>,
+}
+
+impl RecoveryState {
+    /// The vertex is now known but its batch is not: ask the same voters for
+    /// the batch, after giving normal dissemination `wait` to deliver it.
+    fn switch_to_batch(&mut self, digest: BatchDigest, wait: Duration) {
+        self.target = RecoveryTarget::Batch(digest);
+        self.next_idx = 0;
+        self.passes = 0;
+        self.next_request_at = Instant::now() + wait;
+        self.requested_from = None;
+        self.asked.clear();
+    }
+
+    /// Next voter to ask in this pass, skipping ourselves; None at the end.
+    fn next_candidate(&mut self, my_id: NodeId) -> Option<NodeId> {
+        while self.next_idx < self.vote_list.len() {
+            let candidate = self.vote_list[self.next_idx];
+            self.next_idx += 1;
+            if candidate != my_id {
+                return Some(candidate);
+            }
+        }
+        None
+    }
 }
 
 // ── Main struct ───────────────────────────────────────────────────────────────
@@ -375,6 +439,11 @@ pub struct PRBCSailfish {
     execution_pending: HashSet<VertexHash>,
     // in-flight Phase 3 recovery state machines
     recovery_state: HashMap<VertexHash, RecoveryState>,
+    // Delivered vertices and batches, kept for retention_rounds rounds after
+    // they leave the DAG / batch store so peers can still recover them.
+    retained_vertices: RetentionStore<Vertex>,
+    retained_batches: RetentionStore<Vec<u8>>,
+    retention_rounds: u64,
 
     // ── Metrics ──────────────────────────────────────────────────────────────
     last_ordered_round: u64,
@@ -404,6 +473,11 @@ pub struct PRBCSailfish {
     recovery_requests_sent: usize,    // PRBCRecovery messages actually put on the wire
     recovery_responses_ok: usize,     // valid PRBCRecoveryResp certificates applied locally
     recovery_responses_served: usize, // PRBCRecoveryResp this node sent to answer a peer
+    batch_requests_sent: usize,       // BatchRequest messages put on the wire
+    batch_responses_ok: usize,        // valid BatchResp applied locally
+    batch_responses_served: usize,    // BatchResp this node sent to answer a peer
+    recovery_restarts: usize,         // full passes over the voters with no valid answer
+    recoveries_abandoned: usize,      // dropped because the round left the retention window
     network_traffic: Arc<NetworkTrafficStats>,
     network_limit_mbps: Option<f64>,
     consensus_network_percent: f64,
@@ -487,6 +561,10 @@ impl PRBCSailfish {
             execution_ready: HashSet::new(),
             execution_pending: HashSet::new(),
             recovery_state: HashMap::new(),
+            retained_vertices: RetentionStore::new(),
+            retained_batches: RetentionStore::new(),
+            retention_rounds: std::env::var("RETENTION_ROUNDS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_RETENTION_ROUNDS),
 
             last_ordered_round: 0,
             consensus_committed_count: 0,
@@ -506,6 +584,11 @@ impl PRBCSailfish {
             recovery_requests_sent: 0,
             recovery_responses_ok: 0,
             recovery_responses_served: 0,
+            batch_requests_sent: 0,
+            batch_responses_ok: 0,
+            batch_responses_served: 0,
+            recovery_restarts: 0,
+            recoveries_abandoned: 0,
             network_traffic: Arc::new(NetworkTrafficStats::default()),
             network_limit_mbps,
             consensus_network_percent,
@@ -870,13 +953,19 @@ impl PRBCSailfish {
         if let Some(full_vertex) = self.prbc_payloads.remove(&hash) {
             self.on_execution_ready(hash.clone(), full_vertex, dispatcher_tx).await;
         } else if source != self.environment.my_node.id {
-            // Hash-quorum before local payload. Arm a recovery state machine —
-            // but it only sends a PRBCRecovery after recovery_timeout_ms, and
+            // Hash-quorum before local payload. Arm a recovery state machine;
             // on_execution_ready cancels it the moment the propose/batch lands,
             // which is the common case. Escalation to the wire is rare.
             self.payload_lag_count += 1;
             let vote_list: Vec<NodeId> = votes.keys().cloned().collect();
-            self.start_recovery(hash.clone(), vote_list);
+            // If the vertex is already here, parked until its batch arrives,
+            // only the batch is missing.
+            let parked_digest = self
+                .pending_on_batch
+                .iter()
+                .find(|(_, waiters)| waiters.iter().any(|(_, v)| v.hash == hash))
+                .map(|(digest, _)| digest.clone());
+            self.start_recovery(round, hash.clone(), vote_list, parked_digest);
         }
 
         // Re-check commit rule now that we have a new hash-commit.
@@ -915,8 +1004,20 @@ impl PRBCSailfish {
         // bursts with many missing payloads.
         if self.execution_pending.remove(&hash) {
             self.finalized_block_count += 1;
-            if let Some(vertex) = self.dag.vertices.get(&hash) {
-                self.batch_store.remove(&vertex.block);
+            self.retire_batch(&hash);
+        }
+    }
+
+    /// Move an executed vertex's batch from the batch store to the retention
+    /// store, where it stays fetchable for retention_rounds rounds.
+    fn retire_batch(&mut self, hash: &VertexHash) {
+        let Some((round, digest)) = self.dag.vertices.get(hash).map(|v| (v.round, v.block.clone()))
+        else {
+            return;
+        };
+        if let Some(payload) = self.batch_store.remove(&digest) {
+            if self.retention_rounds > 0 {
+                self.retained_batches.insert(round, digest, payload);
             }
         }
     }
@@ -956,10 +1057,20 @@ impl PRBCSailfish {
                     if self.dag.vertices.contains_key(&leader_hash) {
                         self.commit_causal_history_prbc(leader_hash.clone());
                         self.last_ordered_round = r;
-                        self.dag.prune_ordered(
-                            self.last_ordered_round.saturating_sub(4),
+                        let pruned = self.dag.prune_ordered(
+                            self.last_ordered_round.saturating_sub(DAG_PRUNE_DEPTH),
                             &self.already_ordered,
                         );
+                        if self.retention_rounds > 0 {
+                            for vertex in pruned {
+                                // Skeletons (payload never arrived) cannot
+                                // answer a recovery request.
+                                if self.execution_ready.contains(&vertex.hash) {
+                                    self.retained_vertices
+                                        .insert(vertex.round, vertex.hash.clone(), vertex);
+                                }
+                            }
+                        }
                         self.prune_prbc_caches();
                     }
                 }
@@ -970,12 +1081,8 @@ impl PRBCSailfish {
     }
 
     /// Prune payload and vote caches for rounds that are too old to need recovery.
-    /// A 128-round window covers a full quorum-candidate retry cycle for the
-    /// current experiment sizes even when rounds advance quickly.
     fn prune_prbc_caches(&mut self) {
-        // Keep enough history for a recovering node to try every quorum voter.
-        // Vote certificates are small; pruning them too aggressively makes
-        // healthy peers unable to answer late recovery requests.
+        // Pre-quorum vertices, votes and timeouts are small; keep 128 rounds.
         let cutoff = self.last_ordered_round.saturating_sub(128);
         let to_remove: Vec<VertexHash> = self.prbc_payloads
             .iter()
@@ -993,6 +1100,18 @@ impl PRBCSailfish {
             .retain(|round, _| *round == 0 || *round >= cutoff);
         self.timeout_store.retain(|round, _| *round >= cutoff);
         self.timeout_suspended.retain(|round| *round >= cutoff);
+
+        // Retention window. Nothing older can still be served by a correct
+        // peer, so recovery for it is dropped: a process that far behind
+        // needs state transfer, which is out of scope.
+        let horizon = self
+            .last_ordered_round
+            .saturating_sub(self.retention_rounds.max(DAG_PRUNE_DEPTH));
+        self.retained_vertices.prune_below(horizon);
+        self.retained_batches.prune_below(horizon);
+        let before = self.recovery_state.len();
+        self.recovery_state.retain(|_, state| state.round >= horizon);
+        self.recoveries_abandoned += before - self.recovery_state.len();
     }
 
     fn commit_causal_history_prbc(&mut self, leader_hash: VertexHash) {
@@ -1016,9 +1135,7 @@ impl PRBCSailfish {
             // Two-tiered state:
             if self.execution_ready.contains(&h) {
                 self.finalized_block_count += 1;
-                if let Some(vertex) = self.dag.vertices.get(&h) {
-                    self.batch_store.remove(&vertex.block);
-                }
+                self.retire_batch(&h);
             } else {
                 self.execution_pending.insert(h.clone());
             }
@@ -1090,6 +1207,13 @@ impl PRBCSailfish {
         }
         let digest = vertex.block.clone();
         if !self.batch_store.contains(&digest) {
+            // If this vertex was being recovered, only its batch is missing now.
+            let wait = Duration::from_millis(self.recovery_timeout_ms as u64);
+            if let Some(state) = self.recovery_state.get_mut(&hash) {
+                if state.target == RecoveryTarget::Vertex {
+                    state.switch_to_batch(digest.clone(), wait);
+                }
+            }
             let waiters = self.pending_on_batch.entry(digest).or_default();
             if !waiters.iter().any(|(_, pending)| pending.hash == hash) {
                 waiters.push((sender, vertex));
@@ -1233,10 +1357,21 @@ impl PRBCSailfish {
             return;
         }
         self.seen_batches.insert(batch.digest.clone());
+        self.store_batch(batch, true, dispatcher_tx).await;
+    }
 
+    /// Store a verified batch, relay it if `relay` and this process is in S1,
+    /// and release any vertices that were waiting for it.
+    async fn store_batch(
+        &mut self,
+        batch: PRBCBatchMessage,
+        relay: bool,
+        dispatcher_tx: &MessageDispatcher,
+    ) {
         let digest = batch.digest.clone();
         let my_id = self.environment.my_node.id;
-        let targets = if self.sample_verification(&digest)
+        let targets = if relay
+            && self.sample_verification(&digest)
             && self.forwarded_batches.insert(digest.clone())
         {
             let s2_salt = [b"prbc_s2".as_ref(), &my_id.to_be_bytes() as &[u8]].concat();
@@ -1339,29 +1474,33 @@ impl PRBCSailfish {
             );
             return;
         }
+        if self.environment.my_node.behavior == NodeBehavior::Byz4 {
+            return;
+        }
 
-        // Only respond if we have the payload AND enough votes to prove it.
-        // Fall back to dag.vertices if the payload was already moved there by on_hash_quorum.
-        let quorum = self.quorum();
-        let payload = self.prbc_payloads.get(&msg.hash)
-            .or_else(|| self.dag.vertices.get(&msg.hash))
+        // Answer with the full vertex if we hold it. No vote check: the
+        // requester only asks for hashes it already holds 2f+1 votes for, and
+        // checks the vertex against that hash itself. A skeleton (hash
+        // committed, vertex never arrived) is not a full vertex and is not sent.
+        let vertex = self
+            .prbc_payloads
+            .get(&msg.hash)
+            .or_else(|| {
+                self.execution_ready
+                    .contains(&msg.hash)
+                    .then(|| self.dag.vertices.get(&msg.hash))
+                    .flatten()
+            })
+            .or_else(|| self.retained_vertices.get(&msg.hash))
             .cloned();
-        if let Some(vertex) = payload {
-            let vote_key = (vertex.round, vertex.source, msg.hash.clone());
-            if let Some(votes) = self.prbc_votes.get(&vote_key) {
-                if votes.len() >= quorum {
-                    let _ = dispatcher_tx
-                        .send((
-                            DispatchTarget::One(sender),
-                            PRBCMessage::PRBCRecoveryResp(PRBCRecoveryRespMessage {
-                                vertex,
-                                votes: votes.clone(),
-                            }),
-                        ))
-                        .await;
-                    self.recovery_responses_served += 1;
-                }
-            }
+        if let Some(vertex) = vertex {
+            let _ = dispatcher_tx
+                .send((
+                    DispatchTarget::One(sender),
+                    PRBCMessage::PRBCRecoveryResp(PRBCRecoveryRespMessage { vertex }),
+                ))
+                .await;
+            self.recovery_responses_served += 1;
         }
     }
 
@@ -1373,104 +1512,139 @@ impl PRBCSailfish {
     ) {
         let hash = msg.vertex.hash.clone();
 
-        // Ignore if we're not waiting for this hash.
-        if !self.recovery_state.contains_key(&hash) {
-            return;
+        // Only answers to an open vertex request, from a voter we asked. A late
+        // answer from an earlier candidate is as good as one from the current.
+        match self.recovery_state.get(&hash) {
+            Some(state)
+                if state.target == RecoveryTarget::Vertex && state.asked.contains(&sender) => {}
+            _ => return,
         }
         if self.execution_ready.contains(&hash) {
             return;
         }
-        if self
-            .recovery_state
-            .get(&hash)
-            .and_then(|state| state.requested_from)
-            != Some(sender)
-        {
-            return;
-        }
 
-        // Verify hash correctness.
-        if hash != msg.vertex.calculate_hash() {
+        // We hold 2f+1 votes for this hash (recovery is only armed on a hash
+        // quorum), so the vertex needs no certificate of its own: it only has
+        // to hash to h and name one batch digest.
+        if hash != msg.vertex.calculate_hash() || msg.vertex.block.len() != 32 {
             warn!(
-                "[Node {}] Recovery resp from {}: hash mismatch, trying next node",
+                "[Node {}] Recovery resp from {}: invalid vertex, trying next node",
                 self.environment.my_node.id, sender
             );
-            self.force_recovery_retry(&hash);
-            return;
-        }
-
-        // Verify vote quorum certificate.
-        let quorum = self.quorum();
-        if msg.votes.len() < quorum {
-            warn!(
-                "[Node {}] Recovery resp from {}: insufficient votes ({})",
-                self.environment.my_node.id, sender, msg.votes.len()
-            );
-            self.force_recovery_retry(&hash);
-            return;
-        }
-
-        // When vote signatures are enabled, verify each one cryptographically —
-        // the certificate is self-contained and does not rely on local state.
-        // When disabled, fall back to cross-referencing with TCP-authenticated votes.
-        let cert_valid = if self.sign_votes {
-            let valid = msg.votes.iter().filter(|(voter_id, sig)| {
-                self.public_keys.get(voter_id)
-                    .and_then(|pk| Signature::from_bytes(sig).ok().map(|s| (pk, s)))
-                    .map_or(false, |(pk, s)| pk.verify(&hash, &s).is_ok())
-            }).count();
-            valid >= quorum
-        } else {
-            let vote_key = (msg.vertex.round, msg.vertex.source, hash.clone());
-            let my_votes = self.prbc_votes.get(&vote_key).cloned().unwrap_or_default();
-            let overlap = msg.votes.keys().filter(|v| my_votes.contains_key(v)).count();
-            overlap >= self.f + 1
-        };
-
-        if !cert_valid {
-            warn!(
-                "[Node {}] Recovery resp from {}: invalid vote certificate, trying next",
-                self.environment.my_node.id, sender
-            );
-            self.force_recovery_retry(&hash);
+            self.force_recovery_retry(&hash, sender);
             return;
         }
 
         self.recovery_responses_ok += 1;
 
-        // Payload is valid — store and mark execution-ready.
         let digest = msg.vertex.block.clone();
-        if digest.len() != 32 {
-            self.force_recovery_retry(&hash);
-            return;
-        }
         if !self.batch_store.contains(&digest) {
+            // Vertex recovered, batch not here. Park the vertex as a propose
+            // would be, and ask the same voters for the batch.
+            let wait = Duration::from_millis(self.recovery_timeout_ms as u64);
+            if let Some(state) = self.recovery_state.get_mut(&hash) {
+                state.switch_to_batch(digest.clone(), wait);
+            }
             let waiters = self.pending_on_batch.entry(digest).or_default();
             if !waiters.iter().any(|(_, pending)| pending.hash == hash) {
                 waiters.push((sender, msg.vertex));
             }
-            // The vertex itself was recovered and certified. Batch delivery is
-            // tracked independently; do not keep querying peers for the same
-            // vertex while waiting for its digest payload.
-            self.recovery_state.remove(&hash);
             return;
         }
         self.on_execution_ready(hash, msg.vertex, dispatcher_tx).await;
     }
 
-    fn force_recovery_retry(&mut self, hash: &VertexHash) {
+    async fn handle_batch_request(
+        &mut self,
+        sender: NodeId,
+        msg: PRBCBatchRequestMessage,
+        dispatcher_tx: &MessageDispatcher,
+    ) {
+        // Same anti-reflection rule as vertex recovery.
+        if msg.requester != sender {
+            warn!(
+                "[Node {}] Batch request sender/requester mismatch: {} != {}",
+                self.environment.my_node.id, sender, msg.requester
+            );
+            return;
+        }
+        if self.environment.my_node.behavior == NodeBehavior::Byz4 {
+            return;
+        }
+
+        let payload = self
+            .batch_store
+            .get(&msg.digest)
+            .or_else(|| self.retained_batches.get(&msg.digest))
+            .cloned();
+        if let Some(payload) = payload {
+            let _ = dispatcher_tx
+                .send((
+                    DispatchTarget::One(sender),
+                    PRBCMessage::BatchResp(PRBCBatchMessage { digest: msg.digest, payload }),
+                ))
+                .await;
+            self.batch_responses_served += 1;
+        }
+    }
+
+    async fn handle_batch_resp(
+        &mut self,
+        sender: NodeId,
+        batch: PRBCBatchMessage,
+        dispatcher_tx: &MessageDispatcher,
+    ) {
+        // Only answers to an open batch request, from a voter we asked.
+        let target = RecoveryTarget::Batch(batch.digest.clone());
+        let awaiting: Vec<VertexHash> = self
+            .recovery_state
+            .iter()
+            .filter(|(_, state)| state.target == target && state.asked.contains(&sender))
+            .map(|(hash, _)| hash.clone())
+            .collect();
+        if awaiting.is_empty() || self.seen_batches.contains(&batch.digest) {
+            return;
+        }
+
+        // The digest comes from a vertex with 2f+1 votes, so a batch that
+        // hashes to it is the right batch, whoever sent it.
+        if batch_digest(&batch.payload) != batch.digest {
+            warn!(
+                "[Node {}] Batch resp from {}: digest mismatch, trying next node",
+                self.environment.my_node.id, sender
+            );
+            for hash in awaiting {
+                self.force_recovery_retry(&hash, sender);
+            }
+            return;
+        }
+
+        self.batch_responses_ok += 1;
+        self.seen_batches.insert(batch.digest.clone());
+        // A fetched batch is a repair, not dissemination: store it, do not relay it.
+        self.store_batch(batch, false, dispatcher_tx).await;
+    }
+
+    /// An asked voter sent an invalid answer. If it is the one we are waiting
+    /// on, move to the next candidate now instead of waiting out the timeout.
+    fn force_recovery_retry(&mut self, hash: &VertexHash, sender: NodeId) {
         if let Some(state) = self.recovery_state.get_mut(hash) {
-            // tick_recovery advanced next_idx when it selected the current
-            // target, so only make the next candidate eligible immediately.
-            state.request_sent_at =
-                Instant::now() - Duration::from_millis(self.recovery_timeout_ms as u64 + 1);
-            state.requested_from = None;
+            if state.requested_from == Some(sender) {
+                state.next_request_at = Instant::now();
+                state.requested_from = None;
+            }
         }
     }
 
     // ── Phase 3 recovery state machine ────────────────────────────────────────
 
-    fn start_recovery(&mut self, hash: VertexHash, mut vote_list: Vec<NodeId>) {
+    fn start_recovery(
+        &mut self,
+        round: u64,
+        hash: VertexHash,
+        mut vote_list: Vec<NodeId>,
+        parked_digest: Option<BatchDigest>,
+    ) {
         if self.execution_ready.contains(&hash) {
             return;
         }
@@ -1491,87 +1665,95 @@ impl PRBCSailfish {
             vote_list.rotate_left(rotation);
         }
 
-        // Set request_sent_at in the past so the first tick sends immediately.
+        // A missing vertex is requested on the next tick. A missing batch is
+        // normally still in flight on the dissemination plane, so it gets
+        // RECOVERY_TIMEOUT_MS to arrive before the first request.
+        let now = Instant::now();
+        let (target, next_request_at) = match parked_digest {
+            None => (RecoveryTarget::Vertex, now),
+            Some(digest) => (
+                RecoveryTarget::Batch(digest),
+                now + Duration::from_millis(self.recovery_timeout_ms as u64),
+            ),
+        };
         self.recovery_state.insert(
             hash,
             RecoveryState {
+                round,
+                target,
                 vote_list,
                 next_idx: 0,
-                request_sent_at: Instant::now()
-                    - Duration::from_millis(self.recovery_timeout_ms as u64 + 1),
+                passes: 0,
+                next_request_at,
                 requested_from: None,
+                asked: HashSet::new(),
             },
         );
     }
 
     /// Driven from the main event loop's 50 ms tick. Sends or retries recovery
-    /// requests without spawning extra tasks.
+    /// requests without spawning extra tasks. Never gives up inside the
+    /// retention window: after a full pass over the voters with no valid
+    /// answer it starts over, waiting longer between requests.
     async fn tick_recovery(&mut self, dispatcher_tx: &MessageDispatcher) {
         let my_id = self.environment.my_node.id;
+        let now = Instant::now();
 
-        let pending_hashes: Vec<VertexHash> = self
+        let due: Vec<VertexHash> = self
             .recovery_state
-            .keys()
-            .filter(|h| !self.execution_ready.contains(*h))
-            .cloned()
+            .iter()
+            .filter(|(hash, state)| {
+                now >= state.next_request_at && !self.execution_ready.contains(*hash)
+            })
+            .map(|(hash, _)| hash.clone())
             .collect();
 
-        for hash in pending_hashes {
-            let elapsed = self
-                .recovery_state
-                .get(&hash)
-                .map(|s| s.request_sent_at.elapsed().as_millis())
-                .unwrap_or(u128::MAX);
-
-            if elapsed < self.recovery_timeout_ms {
-                continue; // Still waiting for a response.
+        for hash in due {
+            let state = self.recovery_state.get_mut(&hash).unwrap();
+            let mut target = state.next_candidate(my_id);
+            let mut restarted = false;
+            if target.is_none() {
+                // A full pass and no valid answer. At least f+1 voters are
+                // correct and keep the data for the retention window, so
+                // start over, waiting longer between requests.
+                state.next_idx = 0;
+                state.passes += 1;
+                restarted = true;
+                target = state.next_candidate(my_id);
             }
-
-            // Find next candidate (skip self).
-            let target_opt = {
-                let state = self.recovery_state.get_mut(&hash).unwrap();
-                let mut found = None;
-                while state.next_idx < state.vote_list.len() {
-                    let candidate = state.vote_list[state.next_idx];
-                    state.next_idx += 1;
-                    if candidate != my_id {
-                        found = Some(candidate);
-                        break;
+            let passes = state.passes;
+            let wait_ms = (self.recovery_timeout_ms as u64)
+                << passes.min(MAX_RECOVERY_BACKOFF_SHIFT);
+            state.next_request_at = now + Duration::from_millis(wait_ms);
+            state.requested_from = target;
+            let message = target.map(|node| {
+                state.asked.insert(node);
+                match &state.target {
+                    RecoveryTarget::Vertex => PRBCMessage::PRBCRecovery(PRBCRecoveryMessage {
+                        hash: hash.clone(),
+                        requester: my_id,
+                    }),
+                    RecoveryTarget::Batch(digest) => {
+                        PRBCMessage::BatchRequest(PRBCBatchRequestMessage {
+                            digest: digest.clone(),
+                            requester: my_id,
+                        })
                     }
                 }
-                found
-            };
+            });
 
-            match target_opt {
-                Some(target) => {
-                    debug!(
-                        "[Node {}] Recovery: requesting hash {:?} from Node {}",
-                        my_id,
-                        &hash[..4.min(hash.len())],
-                        target
-                    );
-                    let _ = dispatcher_tx
-                        .send((
-                            DispatchTarget::One(target),
-                            PRBCMessage::PRBCRecovery(PRBCRecoveryMessage {
-                                hash: hash.clone(),
-                                requester: my_id,
-                            }),
-                        ))
-                        .await;
-                    self.recovery_requests_sent += 1;
-                    let state = self.recovery_state.get_mut(&hash).unwrap();
-                    state.request_sent_at = Instant::now();
-                    state.requested_from = Some(target);
-                }
-                None => {
-                    warn!(
-                        "[Node {}] Recovery: exhausted all candidates for hash {:?}",
-                        my_id,
-                        &hash[..4.min(hash.len())]
-                    );
-                    // If an unrecoverable leader suspended the timeout, resume
-                    // the timeout path so the protocol can still make progress.
+            if restarted {
+                self.recovery_restarts += 1;
+                warn!(
+                    "[Node {}] Recovery: no valid answer from any voter for hash {:?}, \
+                     starting pass {}",
+                    my_id,
+                    &hash[..4.min(hash.len())],
+                    passes + 1
+                );
+                // If an unrecovered leader suspended the timeout, resume the
+                // timeout path so the protocol can still make progress.
+                if passes == 1 {
                     if let Some(vertex) = self.dag.vertices.get(&hash) {
                         let leader =
                             (vertex.round % self.environment.nodes.len() as u64) as NodeId;
@@ -1579,9 +1761,23 @@ impl PRBCSailfish {
                             self.timeout_suspended.remove(&vertex.round);
                         }
                     }
-                    self.recovery_state.remove(&hash);
                 }
             }
+
+            let (Some(node), Some(message)) = (target, message) else {
+                continue;
+            };
+            match &message {
+                PRBCMessage::PRBCRecovery(_) => self.recovery_requests_sent += 1,
+                _ => self.batch_requests_sent += 1,
+            }
+            debug!(
+                "[Node {}] Recovery: request for hash {:?} sent to Node {}",
+                my_id,
+                &hash[..4.min(hash.len())],
+                node
+            );
+            let _ = dispatcher_tx.send((DispatchTarget::One(node), message)).await;
         }
     }
 
@@ -1696,6 +1892,22 @@ impl PRBCSailfish {
         let source = self.environment.my_node.id;
         let node_ids: Vec<NodeId> = self.environment.nodes.iter().map(|node| node.id).collect();
 
+        // Byz3: send each batch to only 2f+1 peers (the lowest IDs), the batch
+        // counterpart of Byz1. Everything else, including its own S1 relay and
+        // its proposals, stays correct.
+        let batch_peers: Option<Vec<NodeId>> =
+            (self.environment.my_node.behavior == NodeBehavior::Byz3).then(|| {
+                let peers: Vec<NodeId> = node_ids
+                    .iter()
+                    .copied()
+                    .filter(|&id| id != source)
+                    .take(2 * self.f + 1)
+                    .collect();
+                warn!("[Node {}] BYZ3: batches go to only {}/{} peers",
+                    source, peers.len(), node_ids.len() - 1);
+                peers
+            });
+
         // Resolve the effective per-tick batch size and interval once, up
         // front, so print_dag_stats() and the CONFIG printout can both report
         // the actual configuration the generator task below will use. When
@@ -1739,6 +1951,7 @@ impl PRBCSailfish {
                 payload: Vec<u8>,
                 created_at: Instant,
                 node_ids: &[NodeId],
+                batch_peers: &Option<Vec<NodeId>>,
                 dispatcher: &MessageDispatcher,
                 batch_tx: &Sender<(PRBCBatchMessage, Instant)>,
             ) -> bool {
@@ -1749,9 +1962,13 @@ impl PRBCSailfish {
                 };
 
                 // The generator first broadcasts the complete batch to every
-                // other process, independently of consensus.
+                // other process, independently of consensus (Byz3: to 2f+1).
+                let direct = match batch_peers {
+                    Some(peers) => DispatchTarget::Many(peers.clone()),
+                    None => DispatchTarget::All,
+                };
                 if dispatcher
-                    .send((DispatchTarget::All, PRBCMessage::Batch(batch.clone())))
+                    .send((direct, PRBCMessage::Batch(batch.clone())))
                     .await
                     .is_err()
                 {
@@ -1800,6 +2017,7 @@ impl PRBCSailfish {
                         payload,
                         created_at,
                         &node_ids,
+                        &batch_peers,
                         &batch_dispatcher,
                         &batch_tx,
                     ).await {
@@ -1818,6 +2036,7 @@ impl PRBCSailfish {
                         payload,
                         created_at,
                         &node_ids,
+                        &batch_peers,
                         &batch_dispatcher,
                         &batch_tx,
                     ).await {
@@ -1935,6 +2154,12 @@ impl PRBCSailfish {
             PRBCMessage::Timeout(timeout) => {
                 self.handle_timeout_vote(sender, timeout.round, timeout.signature)
                     .await
+            }
+            PRBCMessage::BatchRequest(request) => {
+                self.handle_batch_request(sender, request, dispatcher_tx).await
+            }
+            PRBCMessage::BatchResp(batch) => {
+                self.handle_batch_resp(sender, batch, dispatcher_tx).await
             }
         }
     }
@@ -2388,6 +2613,8 @@ impl PRBCSailfish {
         println!("  Sample size:          {} node(s)", ((n as f64).sqrt() * prbc_c()).ceil() as usize);
         println!("  Input rate:           {}", rate_label);
         println!("  Max batch delay:      {}", max_batch_delay_label);
+        println!("  Recovery timeout:     {} ms", self.recovery_timeout_ms);
+        println!("  Retention window:     {} rounds", self.retention_rounds);
         println!("  Transaction size:     {} B", tx_size);
         println!("  Transactions/block:   {}", n_tx);
         println!("  Block size:           {} B", n_tx * tx_size);
@@ -2410,7 +2637,15 @@ impl PRBCSailfish {
         println!("  Network recoveries:   {}", self.recovery_requests_sent);
         println!("  Recovery resp OK:     {}", self.recovery_responses_ok);
         println!("  Recovery resp served:  {}", self.recovery_responses_served);
+        println!("  Batch requests sent:  {}", self.batch_requests_sent);
+        println!("  Batch resp OK:        {}", self.batch_responses_ok);
+        println!("  Batch resp served:    {}", self.batch_responses_served);
+        println!("  Recovery restarts:    {}", self.recovery_restarts);
+        println!("  Recovery abandoned:   {}", self.recoveries_abandoned);
+        println!("  Recovery pending:     {}", self.recovery_state.len());
         println!("  Batches cached:       {}", self.batch_store.len());
+        println!("  Batches retained:     {}", self.retained_batches.len());
+        println!("  Vertices retained:    {}", self.retained_vertices.len());
         println!("  Control TX bytes:     {} B", control_tx);
         println!("  Control RX bytes:     {} B", control_rx);
         println!("  Consensus-data TX:    {} B", consensus_data_tx);
@@ -2435,5 +2670,47 @@ impl PRBCSailfish {
             }
             _ => println!("  Process CPU:          n/a (no /proc)"),
         }
+    }
+}
+
+#[cfg(test)]
+mod recovery_state_tests {
+    use super::*;
+
+    fn state(vote_list: Vec<NodeId>) -> RecoveryState {
+        RecoveryState {
+            round: 1,
+            target: RecoveryTarget::Vertex,
+            vote_list,
+            next_idx: 0,
+            passes: 0,
+            next_request_at: Instant::now(),
+            requested_from: None,
+            asked: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn candidates_skip_self_and_end_after_one_pass() {
+        let mut s = state(vec![3, 1, 2]);
+        assert_eq!(s.next_candidate(1), Some(3));
+        assert_eq!(s.next_candidate(1), Some(2));
+        assert_eq!(s.next_candidate(1), None);
+        // tick_recovery starts the next pass by resetting the index.
+        s.next_idx = 0;
+        assert_eq!(s.next_candidate(1), Some(3));
+    }
+
+    #[test]
+    fn switching_to_batch_starts_a_fresh_pass() {
+        let mut s = state(vec![3, 1, 2]);
+        s.next_candidate(1);
+        s.asked.insert(3);
+        s.passes = 2;
+        s.switch_to_batch(vec![7; 32], Duration::from_millis(50));
+        assert_eq!(s.target, RecoveryTarget::Batch(vec![7; 32]));
+        assert_eq!((s.next_idx, s.passes), (0, 0));
+        assert!(s.asked.is_empty() && s.requested_from.is_none());
+        assert!(s.next_request_at > Instant::now());
     }
 }

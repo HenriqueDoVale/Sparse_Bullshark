@@ -36,21 +36,23 @@ impl PRBCDag {
 
     /// Prune old vertices only after they have been ordered. Unordered old
     /// vertices must remain available so a later weak edge can include them.
+    /// Returns the removed vertices so the caller can retain them for recovery.
     pub fn prune_ordered(
         &mut self,
         before_round: u64,
         ordered: &HashSet<VertexHash>,
-    ) {
+    ) -> Vec<Vertex> {
         let to_remove: Vec<u64> = self.rounds.keys()
             .filter(|&&r| r < before_round)
             .cloned()
             .collect();
+        let mut removed = Vec::new();
         for r in to_remove {
             if let Some(hashes) = self.rounds.remove(&r) {
                 let mut retained = Vec::new();
                 for hash in hashes {
                     if ordered.contains(&hash) {
-                        self.vertices.remove(&hash);
+                        removed.extend(self.vertices.remove(&hash));
                     } else {
                         retained.push(hash);
                     }
@@ -60,6 +62,7 @@ impl PRBCDag {
                 }
             }
         }
+        removed
     }
 }
 

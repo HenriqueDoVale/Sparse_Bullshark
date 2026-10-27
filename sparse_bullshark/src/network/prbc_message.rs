@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use crate::types::vertex::{NodeId, Vertex, VertexHash};
 use crate::network::message::TimeoutMessage;
@@ -28,20 +27,28 @@ pub struct PRBCVoteMessage {
     pub signature: Vec<u8>,    // Ed25519 sign(hash) when enabled; empty otherwise
 }
 
-/// Phase 3: a targeted request for a payload that arrived via hash quorum only.
+/// Phase 3: a targeted request for a vertex that arrived via hash quorum only.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PRBCRecoveryMessage {
     pub hash: VertexHash,
     pub requester: NodeId,
 }
 
-/// Phase 3 response: payload + the full vote certificate (voter → Ed25519 sig).
-/// When PRBC_SIGS=on the receiver verifies each signature independently.
-/// When PRBC_SIGS=off signatures are empty vecs and TCP-auth cross-reference is used.
+/// Phase 3 response: the vertex alone. The requester already holds 2f+1 votes
+/// for its hash (recovery is only armed on a hash quorum), so it checks
+/// hash(vertex) against that hash and needs no certificate from the responder.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PRBCRecoveryRespMessage {
     pub vertex: Vertex,
-    pub votes: BTreeMap<NodeId, Vec<u8>>,
+}
+
+/// Phase 3, second step: a targeted request for the batch named by a
+/// certified vertex's digest. Answered with `BatchResp`, which the requester
+/// checks against the digest.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PRBCBatchRequestMessage {
+    pub digest: VertexHash,
+    pub requester: NodeId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -54,4 +61,8 @@ pub enum PRBCMessage {
     PRBCRecovery(PRBCRecoveryMessage),
     PRBCRecoveryResp(PRBCRecoveryRespMessage),
     Timeout(TimeoutMessage),
+    /// Request for a missing batch, sent once its vertex is certified and known.
+    BatchRequest(PRBCBatchRequestMessage),
+    /// Unicast answer to a `BatchRequest`. Unlike `Batch`, it is never relayed.
+    BatchResp(PRBCBatchMessage),
 }

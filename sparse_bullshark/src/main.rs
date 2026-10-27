@@ -34,6 +34,8 @@ async fn main() {
                 NodeBehavior::Byz1   => ("BYZ1",   "Byzantine: sends proposal to only 2f+1 peers"),
                 NodeBehavior::Silent => ("SILENT",  "Byzantine: never creates or sends its own vertex"),
                 NodeBehavior::Byz2   => ("BYZ2",   "Byzantine: forwards fake payload (wrong body, original hash)"),
+                NodeBehavior::Byz3   => ("BYZ3",   "Byzantine: sends its batch to only 2f+1 peers (PRBC)"),
+                NodeBehavior::Byz4   => ("BYZ4",   "Byzantine: never answers recovery requests (PRBC)"),
             };
             println!("\n\
                 ╔══════════════════════════════════════════════════════╗\n\
