@@ -69,7 +69,7 @@ def group_by_host(nodes):
 
 # ── Remote script builder ──────────────────────────────────────────────────────
 
-def build_remote_script(node_ids, all_nodes, priv_keys, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, reduced_quorum, decoupled, wan_delay, recovery_timeout_ms, sample_c, max_batch_delay_ms):
+def build_remote_script(node_ids, all_nodes, priv_keys, tx_size, n_tx, mode, input_rate, rbc, no_prbc_sigs, reduced_quorum, decoupled, wan_delay, recovery_timeout_ms, sample_c, max_batch_delay_ms, retention_rounds=None, min_gap_ms=None):
     """Build a bash script that runs all assigned nodes on one machine."""
     # Build the CSV content for the active subset of nodes so the binary sees
     # only the N nodes participating in this run (not the full 50-node file).
@@ -116,6 +116,10 @@ def build_remote_script(node_ids, all_nodes, priv_keys, tx_size, n_tx, mode, inp
         lines.append(f"export PRBC_SAMPLE_C={sample_c}")
     if max_batch_delay_ms is not None:
         lines.append(f"export MAX_BATCH_DELAY_MS={max_batch_delay_ms}")
+    if retention_rounds is not None and mode == "prbc_sailfish":
+        lines.append(f"export RETENTION_ROUNDS={retention_rounds}")
+    if min_gap_ms is not None and mode == "prbc_sailfish":
+        lines.append(f"export MIN_PROPOSAL_GAP_MS={min_gap_ms}")
 
     for nid in node_ids:
         # Single-quote the key: base64 chars never contain single quotes
@@ -290,6 +294,14 @@ async def main():
                              "--input-rate is preserved. Binary default: unset/disabled (today's "
                              "uncapped pacing). Use this to remove the batch-pacing latency floor "
                              "that otherwise dominates at low --input-rate or large --n-nodes.")
+    parser.add_argument("--retention-rounds", type=int, default=None, metavar="R",
+                        help="Override RETENTION_ROUNDS (PRBC-Sailfish only): rounds a delivered "
+                             "vertex and batch are kept so peers can still recover them. "
+                             "Binary default: 50. 0 = keep nothing after execution.")
+    parser.add_argument("--min-gap-ms", type=int, default=None, metavar="MS",
+                        help="PRBC-Sailfish only: minimum time between a node's proposals "
+                             "(MIN_PROPOSAL_GAP_MS). Sets the round rate, hence batch size "
+                             "(load x gap) and CPU. Binary default: none.")
     parser.add_argument("--logs",         action="store_true", help="Print stderr from each machine")
     args = parser.parse_args()
 
@@ -313,7 +325,9 @@ async def main():
     recovery_suffix = f" [recovery timeout: {args.recovery_timeout_ms}ms]" if args.recovery_timeout_ms is not None else ""
     sample_c_suffix = f" [sample C: {args.sample_c}]" if args.sample_c is not None else ""
     mbd_suffix = f" [max batch delay: {args.max_batch_delay_ms}ms]" if args.max_batch_delay_ms is not None else ""
-    print(f"  Protocol:   {args.mode.replace('_', '-').upper()}{rbc_suffix}{quorum_suffix}{mempool_suffix}{wan_suffix}{recovery_suffix}{sample_c_suffix}{mbd_suffix}")
+    retention_suffix = f" [retention: {args.retention_rounds} rounds]" if args.retention_rounds is not None else ""
+    gap_suffix = f" [min gap: {args.min_gap_ms}ms]" if args.min_gap_ms is not None else ""
+    print(f"  Protocol:   {args.mode.replace('_', '-').upper()}{rbc_suffix}{quorum_suffix}{mempool_suffix}{wan_suffix}{recovery_suffix}{sample_c_suffix}{mbd_suffix}{retention_suffix}{gap_suffix}")
     print(f"  Tx size:    {args.tx_size} B")
     print(f"  Tx/block:   {args.n_tx}")
     print(f"  Nodes:      {len(nodes)}")
@@ -333,7 +347,7 @@ async def main():
             node_ids, nodes, priv_keys, args.tx_size, args.n_tx,
             args.mode, args.input_rate, args.rbc, args.no_prbc_sigs, args.reduced_quorum,
             args.decoupled, args.wan_delay, args.recovery_timeout_ms, args.sample_c,
-            args.max_batch_delay_ms,
+            args.max_batch_delay_ms, args.retention_rounds, args.min_gap_ms,
         )
         machine_order.append((ip, node_ids))
         tasks.append(asyncio.create_task(run_on_machine(ip, script, timeout_secs)))
@@ -386,14 +400,27 @@ async def main():
     # read as ~0 even when a real, nonzero number of events happened
     # somewhere. --logs breaks that out per node so it's not hidden.
     if args.logs:
-        cols = ["Payload-lag events", "Network recoveries", "Recovery resp OK", "Recovery resp served"]
+        cols = ["Payload-lag events", "Network recoveries", "Recovery resp OK", "Recovery resp served",
+                "Batch requests sent", "Batch resp OK", "Batch resp served", "Recovery restarts",
+                "Recovery pending", "Recovery abandoned", "Blocks finalized"]
         if any(c in all_results[0] for c in cols):
             print("--------------------------------------------------")
             print(" PER-NODE RECOVERY COUNTERS")
             print("--------------------------------------------------")
-            print(f"{'Node':>6}  " + "  ".join(f"{c:>20}" for c in cols))
+            print(f"{'Node':>6}  " + "  ".join(f"{c:>{len(c)}}" for c in cols))
             for nid, res in sorted(zip(all_node_ids, all_results)):
-                print(f"{nid:>6}  " + "  ".join(f"{res.get(c, '-'):>20}" for c in cols))
+                print(f"{nid:>6}  " + "  ".join(f"{res.get(c, '-'):>{len(c)}}" for c in cols))
+            print()
+        # Leader skipping and certificate fetch (both zero in fault-free runs).
+        cols = ["Ordered rounds", "Leaders skipped", "No-votes sent", "Parent waits",
+                "Cert requests sent", "Cert resp OK", "Cert resp served", "Invalid vertices"]
+        if any(c in all_results[0] for c in cols[1:]):
+            print("--------------------------------------------------")
+            print(" PER-NODE ORDERING COUNTERS")
+            print("--------------------------------------------------")
+            print(f"{'Node':>6}  " + "  ".join(f"{c:>{len(c)}}" for c in cols))
+            for nid, res in sorted(zip(all_node_ids, all_results)):
+                print(f"{nid:>6}  " + "  ".join(f"{res.get(c, '-'):>{len(c)}}" for c in cols))
             print()
 
     if args.logs:
