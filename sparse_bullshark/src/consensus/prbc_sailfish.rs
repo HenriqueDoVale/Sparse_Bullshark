@@ -1132,46 +1132,55 @@ impl PRBCSailfish {
 
     // ── Vertex creation ────────────────────────────────────────────────────────
 
-    /// BFS from the hash-committed strong edges of round r-1 through all
-    /// known_edges and weak_edges. Returns hashes that are hash-committed at
-    /// rounds < r-1 but are not reachable through that traversal.
+    /// Weak edges for a new round-r vertex: certified vertices of rounds
+    /// r − GC_DEPTH … r − 2 that are neither ordered nor reachable from its
+    /// strong edges. The search stops at ordered vertices (their whole history
+    /// is ordered too) and at the bottom of the window (a path to a vertex of
+    /// round x passes only through rounds above x), so its cost depends on the
+    /// unordered window, not on how long the run has been going.
     fn compute_weak_edges_prbc(&self, round: u64, strong_edges: &[VertexHash]) -> Vec<VertexHash> {
-        use std::collections::VecDeque;
-        let mut reachable: HashSet<VertexHash> = HashSet::new();
-        let mut queue: VecDeque<VertexHash> = VecDeque::new();
-
+        let lowest = round.saturating_sub(self.gc_depth()).max(1);
+        let mut reachable: HashSet<&VertexHash> = HashSet::new();
+        let mut stack: Vec<&VertexHash> = Vec::new();
         for h in strong_edges {
-            if reachable.insert(h.clone()) {
-                queue.push_back(h.clone());
+            if reachable.insert(h) {
+                stack.push(h);
             }
         }
-
-        while let Some(h) = queue.pop_front() {
-            let strong = self.known_edges.get(&h).cloned().unwrap_or_default();
-            let weak   = self.dag.vertices.get(&h)
-                .map(|v| v.weak_edges.clone())
-                .unwrap_or_default();
-            for ph in strong.into_iter().chain(weak.into_iter()) {
-                if reachable.insert(ph.clone()) {
-                    queue.push_back(ph.clone());
+        while let Some(h) = stack.pop() {
+            if self.already_ordered.contains(h) {
+                continue;
+            }
+            let Some(edges) = self.vertex_edges.get(h) else {
+                continue;
+            };
+            if edges.round <= lowest {
+                continue;
+            }
+            for parent in edges.strong.iter().chain(edges.weak.iter()) {
+                if reachable.insert(parent) {
+                    stack.push(parent);
                 }
             }
         }
 
-        // Any hash-committed hash at round < r-1 not reachable through the
-        // chain, within the GC window (the vote rule rejects older ones).
-        let gc_depth = self.gc_depth();
-        let mut weak: Vec<VertexHash> = self.hash_committed.iter()
-            .filter(|((r, _), h)| {
-                *r + 1 < round
-                    && *r > 0
-                    && *r + gc_depth >= round
-                    && !reachable.contains(*h)
-                    && !self.already_ordered.contains(*h)
-                    && self.dag.vertices.contains_key(*h)
-            })
-            .map(|(_, h)| h.clone())
-            .collect();
+        let mut weak = Vec::new();
+        for r in lowest..round.saturating_sub(1) {
+            let Some(sources) = self.hash_committed_by_round.get(&r) else {
+                continue;
+            };
+            for source in sources {
+                let Some(h) = self.hash_committed.get(&(r, *source)) else {
+                    continue;
+                };
+                if !reachable.contains(h)
+                    && !self.already_ordered.contains(h)
+                    && self.dag.vertices.contains_key(h)
+                {
+                    weak.push(h.clone());
+                }
+            }
+        }
         weak.sort();
         weak
     }
@@ -1407,17 +1416,27 @@ impl PRBCSailfish {
             return;
         }
 
+        // Walk back in one downward sweep. `frontier` holds the vertices one
+        // round up that the last kept leader reaches by strong edges; strong
+        // edges always go exactly one round down (CHECK_PARENTS), so their
+        // strong parents are what it reaches in round r. Same result as a
+        // strong-path search per round, in time linear in the window.
         let mut chain = vec![anchor_hash.clone()];
-        let mut current = anchor_hash;
+        let mut frontier: HashSet<VertexHash> = HashSet::from([anchor_hash]);
         for r in ((end_round + 1)..anchor_round).rev() {
-            let Some(leader_hash) = self.hash_committed.get(&(r, self.leader_of(r))).cloned()
-            else {
-                continue;
-            };
-            if self.strong_path(&current, &leader_hash, r) {
-                chain.push(leader_hash.clone());
-                current = leader_hash;
+            let mut reached: HashSet<VertexHash> = HashSet::new();
+            for h in &frontier {
+                if let Some(edges) = self.vertex_edges.get(h) {
+                    reached.extend(edges.strong.iter().cloned());
+                }
             }
+            if let Some(leader_hash) = self.hash_committed.get(&(r, self.leader_of(r))) {
+                if reached.contains(leader_hash) {
+                    chain.push(leader_hash.clone());
+                    reached = HashSet::from([leader_hash.clone()]);
+                }
+            }
+            frontier = reached;
         }
         self.leaders_skipped += (anchor_round - end_round) as usize - chain.len();
 
@@ -1462,58 +1481,40 @@ impl PRBCSailfish {
     /// any hash not certified here; a certified vertex whose body is missing
     /// is already being recovered (armed in on_hash_quorum).
     fn history_complete(&mut self, anchor: &VertexHash) -> bool {
-        let mut complete = true;
-        let mut seen: HashSet<VertexHash> = HashSet::new();
-        // (hash, slot of the vertex that referenced it)
-        let mut stack: Vec<(VertexHash, Option<(u64, NodeId)>)> = vec![(anchor.clone(), None)];
-        let mut wanted: Vec<(VertexHash, u64, NodeId)> = Vec::new();
-        while let Some((hash, child)) = stack.pop() {
-            if self.already_ordered.contains(&hash) || !seen.insert(hash.clone()) {
-                continue;
-            }
-            let Some(&slot) = self.certified_slot.get(&hash) else {
-                complete = false;
-                if let Some((round, source)) = child {
-                    wanted.push((hash, round, source));
-                }
-                continue;
-            };
-            let Some(edges) = self.vertex_edges.get(&hash) else {
-                complete = false;
-                continue;
-            };
-            for parent in edges.strong.iter().chain(edges.weak.iter()) {
-                stack.push((parent.clone(), Some(slot)));
-            }
-        }
+        let (complete, wanted) = self.history_gaps(anchor);
         for (hash, round, source) in wanted {
             self.want_certificate(hash, round, vec![source]);
         }
         complete
     }
 
-    /// Is there a path from `from` down to `to` (a vertex of round `to_round`)
-    /// along strong edges only?
-    fn strong_path(&self, from: &VertexHash, to: &VertexHash, to_round: u64) -> bool {
+    /// Whether the anchor's unordered history is complete, and the hashes in
+    /// it not certified here, each with the slot of a vertex referencing it.
+    fn history_gaps(&self, anchor: &VertexHash) -> (bool, Vec<(VertexHash, u64, NodeId)>) {
+        let mut complete = true;
+        let mut wanted = Vec::new();
         let mut seen: HashSet<&VertexHash> = HashSet::new();
-        let mut stack = vec![from];
-        while let Some(hash) = stack.pop() {
-            if hash == to {
-                return true;
-            }
-            if !seen.insert(hash) {
+        let mut stack: Vec<(&VertexHash, Option<(u64, NodeId)>)> = vec![(anchor, None)];
+        while let Some((hash, child)) = stack.pop() {
+            if self.already_ordered.contains(hash) || !seen.insert(hash) {
                 continue;
             }
-            let Some(edges) = self.vertex_edges.get(hash) else {
+            let Some(&slot) = self.certified_slot.get(hash) else {
+                complete = false;
+                if let Some((round, source)) = child {
+                    wanted.push((hash.clone(), round, source));
+                }
                 continue;
             };
-            if edges.round > to_round + 1 {
-                stack.extend(edges.strong.iter());
-            } else if edges.round == to_round + 1 && edges.strong.contains(to) {
-                return true;
+            let Some(edges) = self.vertex_edges.get(hash) else {
+                complete = false;
+                continue;
+            };
+            for parent in edges.strong.iter().chain(edges.weak.iter()) {
+                stack.push((parent, Some(slot)));
             }
         }
-        false
+        (complete, wanted)
     }
 
     /// Prune payload and vote caches for rounds that are too old to need recovery.
