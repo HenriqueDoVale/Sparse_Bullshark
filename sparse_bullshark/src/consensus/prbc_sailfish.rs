@@ -350,6 +350,8 @@ impl TrafficPlane {
 
 #[derive(Default)]
 struct NetworkTrafficStats {
+    // Votes dropped on a reader task because their slot was already certified.
+    late_votes_dropped: AtomicU64,
     control_tx_bytes: AtomicU64,
     control_rx_bytes: AtomicU64,
     consensus_data_tx_bytes: AtomicU64,
@@ -648,6 +650,18 @@ pub struct PRBCSailfish {
     // Transactions in executed batches, counted from each batch's payload.
     executed_tx_count: u64,
 
+    // Minimum time between this party's proposals (MIN_PROPOSAL_GAP_MS,
+    // 0 = none). Each round costs about n² vote-signature checks whatever
+    // the batch size, so the gap sets the round rate, and with it the batch
+    // size (load × gap) and the CPU. Narwhal's batch and header timers play
+    // the same role.
+    min_proposal_gap: Duration,
+    last_proposal_at: Instant,
+    // Slots certified here, shared with the reader tasks: a vote for one of
+    // them is dropped there without checking its signature, since the
+    // consensus loop would ignore it anyway.
+    certified_slots: Arc<std::sync::RwLock<HashSet<(u64, NodeId)>>>,
+
     // Per-process CPU / memory sampling, started when the timed run begins.
     resource_meter: Option<ResourceMeter>,
 }
@@ -773,6 +787,13 @@ impl PRBCSailfish {
             byz3_batch_peers: None,
             executed_tx_count: 0,
 
+            min_proposal_gap: Duration::from_millis(
+                std::env::var("MIN_PROPOSAL_GAP_MS")
+                    .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            ),
+            last_proposal_at: Instant::now(),
+            certified_slots: Arc::new(std::sync::RwLock::new(HashSet::new())),
+
             resource_meter: None,
         };
         node.add_genesis_block();
@@ -810,6 +831,15 @@ impl PRBCSailfish {
             .filter(|&id| id != my_id)
             .take(2 * self.f + 1)
             .collect()
+    }
+
+    /// How long the idle main loop sleeps: the 50 ms tick, or less if the
+    /// proposal gap ends sooner.
+    fn idle_wait(&self) -> Duration {
+        let tick = Duration::from_millis(50);
+        let gap_end = self.last_proposal_at + self.min_proposal_gap;
+        let now = Instant::now();
+        if gap_end > now { tick.min(gap_end - now) } else { tick }
     }
 
     fn sign(&self, bytes: &[u8]) -> Vec<u8> {
@@ -919,11 +949,17 @@ impl PRBCSailfish {
             progress = false;
 
             if self.may_advance_round(dispatcher_tx).await {
+                // At most one proposal per gap; the main loop wakes up when
+                // the gap ends (idle_wait).
+                if self.last_proposal_at.elapsed() < self.min_proposal_gap {
+                    return;
+                }
                 progress = true;
                 let my_id = self.environment.my_node.id;
 
                 if self.environment.my_node.behavior == NodeBehavior::Silent {
                     // Silent: advance round state but never create or announce a vertex.
+                    self.last_proposal_at = Instant::now();
                     self.round += 1;
                     self.round_start_time = Instant::now();
                     self.timeout_sent = false;
@@ -940,6 +976,7 @@ impl PRBCSailfish {
                     } else {
                         self.make_batch(dispatcher_tx).await
                     };
+                    self.last_proposal_at = Instant::now();
                     let new_vertex = self.create_new_vertex(self.round, block);
                     let signature = self.sign(&propose_signing_bytes(&new_vertex.hash));
                     self.vertex_timestamps.entry(new_vertex.hash.clone()).or_insert_with(Instant::now);
@@ -1258,6 +1295,9 @@ impl PRBCSailfish {
         self.hash_committed.insert((round, source), hash.clone());
         self.hash_committed_by_round.entry(round).or_default().insert(source);
         self.certified_slot.insert(hash.clone(), (round, source));
+        if let Ok(mut slots) = self.certified_slots.write() {
+            slots.insert((round, source));
+        }
         self.cert_wanted.remove(&hash);
         // Proposals that were waiting for this parent can be checked again.
         if let Some(children) = self.parent_waiters.remove(&hash) {
@@ -1539,6 +1579,9 @@ impl PRBCSailfish {
         self.timeout_suspended.retain(|round| *round >= cutoff);
         self.vertex_edges.retain(|_, edges| edges.round >= cutoff);
         self.no_votes.retain(|round, _| *round >= cutoff);
+        if let Ok(mut slots) = self.certified_slots.write() {
+            slots.retain(|(round, _)| *round >= cutoff);
+        }
 
         // Retention window. Nothing older can still be served by a correct
         // peer, so recovery for it is dropped: a process that far behind
@@ -2801,6 +2844,7 @@ impl PRBCSailfish {
                 break;
             }
 
+            let idle_wait = self.idle_wait();
             // Biased selection always observes votes, timeouts, and recovery
             // requests before considering larger consensus-data or batch frames.
             tokio::select! {
@@ -2829,7 +2873,7 @@ impl PRBCSailfish {
                         None => dissemination_open = false,
                     }
                 }
-                _ = sleep(Duration::from_millis(50)) => {}
+                _ = sleep(idle_wait) => {}
             }
 
             // Amortise actor work while bounding lower-priority service. A
@@ -2984,6 +3028,7 @@ impl PRBCSailfish {
         // Keys for checking vote signatures on the reader tasks; None when
         // PRBC_SIGS=off.
         let vote_keys = self.sign_votes.then(|| Arc::new(self.public_keys.clone()));
+        let certified_slots = self.certified_slots.clone();
 
         // Incoming: 3×(n-1) connections, one per peer per plane.
         let mut accepted = 0;
@@ -3042,6 +3087,7 @@ impl PRBCSailfish {
                             };
                             let network_traffic = self.network_traffic.clone();
                             let vote_keys = vote_keys.clone();
+                            let certified_slots = certified_slots.clone();
                             tokio::spawn(async move {
                                 Self::handle_connection(
                                     stream,
@@ -3051,6 +3097,7 @@ impl PRBCSailfish {
                                     plane,
                                     network_traffic,
                                     vote_keys,
+                                    certified_slots,
                                 )
                                 .await;
                             });
@@ -3090,6 +3137,7 @@ impl PRBCSailfish {
         plane: TrafficPlane,
         network_traffic: Arc<NetworkTrafficStats>,
         vote_keys: Option<Arc<HashMap<NodeId, PublicKey>>>,
+        certified_slots: Arc<std::sync::RwLock<HashSet<(u64, NodeId)>>>,
     ) {
         info!(
             "[Node {}] Listening for messages from Node {}",
@@ -3127,6 +3175,18 @@ impl PRBCSailfish {
                 let frame_bytes =
                     (MESSAGE_BYTES_LENGTH + length as usize + SIGNATURE_BYTES_LENGTH) as u64;
                 network_traffic.record_rx(plane, frame_bytes);
+                // A vote for a slot already certified here would be ignored
+                // by the consensus loop: drop it without checking its
+                // signature. About f of every n votes per vertex arrive late.
+                if let PRBCMessage::PRBCVote(vote) = &message {
+                    let late = certified_slots
+                        .read()
+                        .map_or(false, |slots| slots.contains(&(vote.round, vote.source)));
+                    if late {
+                        network_traffic.late_votes_dropped.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                }
                 // Check signatures here, one reader task per peer, so the
                 // checks run in parallel instead of one at a time in the
                 // consensus loop. An invalid message is dropped.
@@ -3374,6 +3434,11 @@ impl PRBCSailfish {
         } else {
             println!("  Batching:             at proposal time, size from load");
         }
+        if self.min_proposal_gap.is_zero() {
+            println!("  Min proposal gap:     none");
+        } else {
+            println!("  Min proposal gap:     {} ms", self.min_proposal_gap.as_millis());
+        }
         println!("  Recovery timeout:     {} ms", self.recovery_timeout_ms);
         println!("  Retention window:     {} rounds", self.retention_rounds);
         println!("  Transaction size:     {} B", tx_size);
@@ -3392,6 +3457,8 @@ impl PRBCSailfish {
         println!("  Ordered rounds:       {}", self.last_ordered_round);
         println!("  Blocks finalized:     {}", self.finalized_block_count);
         println!("  Avg batch size:       {:.1} tx", avg_batch);
+        println!("  Late votes dropped:   {}",
+            NetworkTrafficStats::load(&self.network_traffic.late_votes_dropped));
         println!("  Rounds/s:             {:.1}", rps);
         println!("  Consensus TPS:        {:.0} tx/s", con_tps);
         println!("  Consensus BPS:        {:.0} B/s", con_bps);
