@@ -141,6 +141,14 @@ fn verify_signatures(message: &mut PRBCMessage, keys: &HashMap<NodeId, PublicKey
     }
 }
 
+/// Number of transactions in a batch payload: bincode writes a Vec's length
+/// as its first 8 bytes (little-endian). Used only for throughput reporting.
+fn batch_tx_count(payload: &[u8]) -> u64 {
+    payload
+        .get(..8)
+        .map_or(0, |len| u64::from_le_bytes(len.try_into().unwrap()))
+}
+
 // Dispatcher routing tag.
 #[derive(Debug)]
 enum DispatchTarget {
@@ -624,6 +632,22 @@ pub struct PRBCSailfish {
     // real throughput instead of assuming a full-size batch every time.
     effective_n_tx: usize,
 
+    // ── Batching ─────────────────────────────────────────────────────────────
+    // Default: transactions are always available, and a party builds its batch
+    // when it proposes. The load only sets the batch size: the transactions
+    // that arrived at INPUT_RATE / n since its last batch, up to
+    // n_transactions, the rest carried over. Rounds run as fast as the
+    // protocol allows. BATCH_MODE=paced restores the old generator, which
+    // made a full batch every n_tx·n / rate and made proposals wait for it.
+    paced_batches: bool,
+    tx_gen: Option<TransactionGenerator>,
+    last_batch_at: Instant,
+    accrued_tx: f64,
+    batch_seq: u64,
+    byz3_batch_peers: Option<Vec<NodeId>>,
+    // Transactions in executed batches, counted from each batch's payload.
+    executed_tx_count: u64,
+
     // Per-process CPU / memory sampling, started when the timed run begins.
     resource_meter: Option<ResourceMeter>,
 }
@@ -741,6 +765,14 @@ impl PRBCSailfish {
                 .ok().and_then(|v| v.parse::<u64>().ok()).filter(|&v| v > 0),
             effective_n_tx: n_tx_default,
 
+            paced_batches: std::env::var("BATCH_MODE").as_deref() == Ok("paced"),
+            tx_gen: None,
+            last_batch_at: Instant::now(),
+            accrued_tx: 0.0,
+            batch_seq: 0,
+            byz3_batch_peers: None,
+            executed_tx_count: 0,
+
             resource_meter: None,
         };
         node.add_genesis_block();
@@ -817,6 +849,68 @@ impl PRBCSailfish {
         }
     }
 
+    /// Build this party's next batch now, at proposal time. Transactions are
+    /// always available; the load decides how many go in: those that arrived
+    /// at INPUT_RATE / n since the previous batch, at most n_transactions,
+    /// the rest carried to the next batch. With INPUT_RATE = 0 (unlimited)
+    /// every batch is full. The batch is sent as the generator sent it: to
+    /// every party, and to this party's S2 set if it is in S1.
+    async fn make_batch(&mut self, dispatcher_tx: &MessageDispatcher) -> (BatchDigest, Instant) {
+        let now = Instant::now();
+        let max_batch = self.environment.n_transactions;
+        let count = if self.environment.input_rate == 0 {
+            max_batch
+        } else {
+            let per_node_rate =
+                self.environment.input_rate as f64 / self.environment.nodes.len() as f64;
+            self.accrued_tx += per_node_rate * now.duration_since(self.last_batch_at).as_secs_f64();
+            let count = (self.accrued_tx.floor() as usize).min(max_batch);
+            self.accrued_tx -= count as f64;
+            count
+        };
+        self.last_batch_at = now;
+
+        let transactions = self
+            .tx_gen
+            .as_mut()
+            .expect("tx generator is created in start()")
+            .generate_n(count);
+        // A (source, sequence) tag after the transactions makes every batch
+        // unique, empty ones included: equal digests would let one vertex's
+        // execution retire another vertex's batch. The transaction count stays
+        // in the first 8 bytes (batch_tx_count).
+        let my_id = self.environment.my_node.id;
+        let tag = ((my_id as u64) << 48) | self.batch_seq;
+        self.batch_seq += 1;
+        let payload =
+            bincode::serialize(&(transactions, tag)).expect("batch serialize failed");
+        let digest = batch_digest(&payload);
+        let batch = PRBCBatchMessage { digest: digest.clone(), payload };
+
+        let direct = match &self.byz3_batch_peers {
+            Some(peers) => DispatchTarget::Many(peers.clone()),
+            None => DispatchTarget::All,
+        };
+        let _ = dispatcher_tx.send((direct, PRBCMessage::Batch(batch.clone()))).await;
+        if self.sample_verification(&digest) {
+            let s2_salt = [b"prbc_s2".as_ref(), &my_id.to_be_bytes() as &[u8]].concat();
+            let s2_targets: Vec<NodeId> = self
+                .compute_sample(&digest, &s2_salt)
+                .into_iter()
+                .filter(|target| *target != my_id)
+                .collect();
+            if !s2_targets.is_empty() {
+                let _ = dispatcher_tx
+                    .send((DispatchTarget::Many(s2_targets), PRBCMessage::Batch(batch.clone())))
+                    .await;
+            }
+            self.forwarded_batches.insert(digest.clone());
+        }
+        self.seen_batches.insert(digest.clone());
+        self.batch_store.insert(digest.clone(), batch.payload);
+        (digest, now)
+    }
+
     // ── Main work loop ────────────────────────────────────────────────────────
 
     async fn process_work_loop(&mut self, dispatcher_tx: &MessageDispatcher) {
@@ -836,10 +930,15 @@ impl PRBCSailfish {
                     self.current_round_tc = None;
                     warn!("[Node {}] SILENT: skipped PRBC propose for round {}", my_id, self.round - 1);
                 } else {
-                    // Never block the consensus actor waiting for transaction
-                    // generation; it must keep servicing votes and timeouts.
-                    let Some((block, batch_time)) = self.try_next_batch() else {
-                        return;
+                    let (block, batch_time) = if self.paced_batches {
+                        // Never block the consensus actor waiting for transaction
+                        // generation; it must keep servicing votes and timeouts.
+                        let Some(batch) = self.try_next_batch() else {
+                            return;
+                        };
+                        batch
+                    } else {
+                        self.make_batch(dispatcher_tx).await
                     };
                     let new_vertex = self.create_new_vertex(self.round, block);
                     let signature = self.sign(&propose_signing_bytes(&new_vertex.hash));
@@ -1251,6 +1350,13 @@ impl PRBCSailfish {
         }
     }
 
+    /// The batch is here, live or already executed and retained. A vertex
+    /// whose batch was retired by another vertex's execution (a Byzantine
+    /// party can reuse a digest) still finds it.
+    fn has_batch(&self, digest: &BatchDigest) -> bool {
+        self.batch_store.contains(digest) || self.retained_batches.get(digest).is_some()
+    }
+
     /// Move an executed vertex's batch from the batch store to the retention
     /// store, where it stays fetchable for retention_rounds rounds.
     fn retire_batch(&mut self, hash: &VertexHash) {
@@ -1259,6 +1365,7 @@ impl PRBCSailfish {
             return;
         };
         if let Some(payload) = self.batch_store.remove(&digest) {
+            self.executed_tx_count += batch_tx_count(&payload);
             if self.retention_rounds > 0 {
                 self.retained_batches.insert(round, digest, payload);
             }
@@ -1547,7 +1654,7 @@ impl PRBCSailfish {
         // whether or not this process ever votes for it.
         self.record_vertex_edges(&vertex);
         let digest = vertex.block.clone();
-        if !self.batch_store.contains(&digest) {
+        if !self.has_batch(&digest) {
             // If this vertex was being recovered, only its batch is missing now.
             let wait = Duration::from_millis(self.recovery_timeout_ms as u64);
             if let Some(state) = self.recovery_state.get_mut(&hash) {
@@ -1911,7 +2018,7 @@ impl PRBCSailfish {
         self.record_vertex_edges(&msg.vertex);
 
         let digest = msg.vertex.block.clone();
-        if !self.batch_store.contains(&digest) {
+        if !self.has_batch(&digest) {
             // Vertex recovered, batch not here. Park the vertex as a propose
             // would be, and ask the same voters for the batch. It is
             // certified, so it is never voted on and needs no signature.
@@ -2565,113 +2672,120 @@ impl PRBCSailfish {
             (0, n_tx)
         };
         self.effective_n_tx = effective_n_tx;
+        self.byz3_batch_peers = batch_peers.clone();
 
-        let (batch_tx, batch_rx) =
-            tokio::sync::mpsc::channel::<(PRBCBatchMessage, Instant)>(64);
-        self.batch_receiver = Some(batch_rx);
-        let batch_dispatcher = dispatcher_tx.clone();
-        tokio::spawn(async move {
-            async fn disseminate_then_enqueue(
-                source: NodeId,
-                payload: Vec<u8>,
-                created_at: Instant,
-                node_ids: &[NodeId],
-                batch_peers: &Option<Vec<NodeId>>,
-                dispatcher: &MessageDispatcher,
-                batch_tx: &Sender<(PRBCBatchMessage, Instant)>,
-            ) -> bool {
-                let digest = batch_digest(&payload);
-                let batch = PRBCBatchMessage {
-                    digest,
-                    payload,
-                };
+        if !self.paced_batches {
+            // Batches are built at proposal time (make_batch); no generator task.
+            self.tx_gen = Some(TransactionGenerator::new(tx_size, n_tx));
+        } else {
+            let (batch_tx, batch_rx) =
+                tokio::sync::mpsc::channel::<(PRBCBatchMessage, Instant)>(64);
+            self.batch_receiver = Some(batch_rx);
+            let batch_dispatcher = dispatcher_tx.clone();
+            tokio::spawn(async move {
+                async fn disseminate_then_enqueue(
+                    source: NodeId,
+                    payload: Vec<u8>,
+                    created_at: Instant,
+                    node_ids: &[NodeId],
+                    batch_peers: &Option<Vec<NodeId>>,
+                    dispatcher: &MessageDispatcher,
+                    batch_tx: &Sender<(PRBCBatchMessage, Instant)>,
+                ) -> bool {
+                    let digest = batch_digest(&payload);
+                    let batch = PRBCBatchMessage {
+                        digest,
+                        payload,
+                    };
 
-                // The generator first broadcasts the complete batch to every
-                // other process, independently of consensus (Byz3: to 2f+1).
-                let direct = match batch_peers {
-                    Some(peers) => DispatchTarget::Many(peers.clone()),
-                    None => DispatchTarget::All,
-                };
-                if dispatcher
-                    .send((direct, PRBCMessage::Batch(batch.clone())))
-                    .await
-                    .is_err()
-                {
-                    return false;
-                }
-
-                // The source is also a process. If the batch hash selects it
-                // for S1, perform its per-member S2 relay immediately.
-                let s1 = compute_sample_for_nodes(node_ids, &batch.digest, b"prbc_s1");
-                if s1.contains(&source) {
-                    let s2_salt =
-                        [b"prbc_s2".as_ref(), &source.to_be_bytes() as &[u8]].concat();
-                    let s2_targets: Vec<NodeId> =
-                        compute_sample_for_nodes(node_ids, &batch.digest, &s2_salt)
-                            .into_iter()
-                            .filter(|target| *target != source)
-                            .collect();
-                    if !s2_targets.is_empty()
-                        && dispatcher
-                            .send((
-                                DispatchTarget::Many(s2_targets),
-                                PRBCMessage::Batch(batch.clone()),
-                            ))
-                            .await
-                            .is_err()
+                    // The generator first broadcasts the complete batch to every
+                    // other process, independently of consensus (Byz3: to 2f+1).
+                    let direct = match batch_peers {
+                        Some(peers) => DispatchTarget::Many(peers.clone()),
+                        None => DispatchTarget::All,
+                    };
+                    if dispatcher
+                        .send((direct, PRBCMessage::Batch(batch.clone())))
+                        .await
+                        .is_err()
                     {
                         return false;
                     }
+
+                    // The source is also a process. If the batch hash selects it
+                    // for S1, perform its per-member S2 relay immediately.
+                    let s1 = compute_sample_for_nodes(node_ids, &batch.digest, b"prbc_s1");
+                    if s1.contains(&source) {
+                        let s2_salt =
+                            [b"prbc_s2".as_ref(), &source.to_be_bytes() as &[u8]].concat();
+                        let s2_targets: Vec<NodeId> =
+                            compute_sample_for_nodes(node_ids, &batch.digest, &s2_salt)
+                                .into_iter()
+                                .filter(|target| *target != source)
+                                .collect();
+                        if !s2_targets.is_empty()
+                            && dispatcher
+                                .send((
+                                    DispatchTarget::Many(s2_targets),
+                                    PRBCMessage::Batch(batch.clone()),
+                                ))
+                                .await
+                                .is_err()
+                        {
+                            return false;
+                        }
+                    }
+
+                    batch_tx.send((batch, created_at)).await.is_ok()
                 }
 
-                batch_tx.send((batch, created_at)).await.is_ok()
-            }
-
-            if input_rate > 0 {
-                let mut gen = TransactionGenerator::new(tx_size, effective_n_tx);
-                let mut ticker = tokio::time::interval(Duration::from_micros(effective_interval_us));
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    ticker.tick().await;
-                    let transactions = gen.generate();
-                    let created_at = Instant::now();
-                    let payload =
-                        bincode::serialize(&transactions).expect("batch serialize failed");
-                    if !disseminate_then_enqueue(
-                        source,
-                        payload,
-                        created_at,
-                        &node_ids,
-                        &batch_peers,
-                        &batch_dispatcher,
-                        &batch_tx,
-                    ).await {
-                        break;
+                if input_rate > 0 {
+                    let mut gen = TransactionGenerator::new(tx_size, effective_n_tx);
+                    let mut ticker = tokio::time::interval(Duration::from_micros(effective_interval_us));
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        ticker.tick().await;
+                        let transactions = gen.generate();
+                        let created_at = Instant::now();
+                        let payload =
+                            bincode::serialize(&transactions).expect("batch serialize failed");
+                        if !disseminate_then_enqueue(
+                            source,
+                            payload,
+                            created_at,
+                            &node_ids,
+                            &batch_peers,
+                            &batch_dispatcher,
+                            &batch_tx,
+                        ).await {
+                            break;
+                        }
+                    }
+                } else {
+                    let mut gen = TransactionGenerator::new(tx_size, n_tx);
+                    loop {
+                        let transactions = gen.generate();
+                        let created_at = Instant::now();
+                        let payload =
+                            bincode::serialize(&transactions).expect("batch serialize failed");
+                        if !disseminate_then_enqueue(
+                            source,
+                            payload,
+                            created_at,
+                            &node_ids,
+                            &batch_peers,
+                            &batch_dispatcher,
+                            &batch_tx,
+                        ).await {
+                            break;
+                        }
                     }
                 }
-            } else {
-                let mut gen = TransactionGenerator::new(tx_size, n_tx);
-                loop {
-                    let transactions = gen.generate();
-                    let created_at = Instant::now();
-                    let payload =
-                        bincode::serialize(&transactions).expect("batch serialize failed");
-                    if !disseminate_then_enqueue(
-                        source,
-                        payload,
-                        created_at,
-                        &node_ids,
-                        &batch_peers,
-                        &batch_dispatcher,
-                        &batch_tx,
-                    ).await {
-                        break;
-                    }
-                }
-            }
-        });
+            });
+        }
 
         let start_time = Instant::now();
+        self.last_batch_at = start_time;
         let duration = Duration::from_secs(EXECUTION_DURATION);
         self.resource_meter = Some(ResourceMeter::start());
 
@@ -3155,8 +3269,14 @@ impl PRBCSailfish {
         let n_tx_configured = self.environment.n_transactions;
         let exec_secs  = EXECUTION_DURATION as f64;
 
-        let con_tx    = self.consensus_committed_count * n_tx;
-        let exe_tx    = self.finalized_block_count * n_tx;
+        // Batch sizes follow the load, so transactions are counted from each
+        // executed batch's payload. An ordered vertex counts once its batch is
+        // local; at the end of a run that is every ordered vertex but a few.
+        let con_tx    = self.executed_tx_count as usize;
+        let exe_tx    = self.executed_tx_count as usize;
+        let avg_batch = if self.finalized_block_count > 0 {
+            self.executed_tx_count as f64 / self.finalized_block_count as f64
+        } else { 0.0 };
         let con_bytes = con_tx * tx_size;
         let exe_bytes = exe_tx * tx_size;
         let con_tps   = con_tx as f64 / exec_secs;
@@ -3247,12 +3367,22 @@ impl PRBCSailfish {
         println!("  Sample C:             {:.2}", prbc_c());
         println!("  Sample size:          {} node(s)", ((n as f64).sqrt() * prbc_c()).ceil() as usize);
         println!("  Input rate:           {}", rate_label);
-        println!("  Max batch delay:      {}", max_batch_delay_label);
+        if self.paced_batches {
+            println!("  Batching:             paced generator (BATCH_MODE=paced)");
+            println!("  Max batch delay:      {}", max_batch_delay_label);
+        } else {
+            println!("  Batching:             at proposal time, size from load");
+        }
         println!("  Recovery timeout:     {} ms", self.recovery_timeout_ms);
         println!("  Retention window:     {} rounds", self.retention_rounds);
         println!("  Transaction size:     {} B", tx_size);
-        println!("  Transactions/block:   {}", n_tx);
-        println!("  Block size:           {} B", n_tx * tx_size);
+        if self.paced_batches {
+            println!("  Transactions/block:   {}", n_tx);
+            println!("  Block size:           {} B", n_tx * tx_size);
+        } else {
+            println!("  Max transactions/block: {}", n_tx);
+            println!("  Max block size:       {} B", n_tx * tx_size);
+        }
         println!("  Execution time:       {} s", EXECUTION_DURATION);
         println!("  Network budget:       {}", network_budget_label);
         println!("  Consensus reservation:  {}", consensus_reservation_label);
@@ -3260,6 +3390,7 @@ impl PRBCSailfish {
         println!("\n+ RESULTS:");
         println!("  Ordered rounds:       {}", self.last_ordered_round);
         println!("  Blocks finalized:     {}", self.finalized_block_count);
+        println!("  Avg batch size:       {:.1} tx", avg_batch);
         println!("  Rounds/s:             {:.1}", rps);
         println!("  Consensus TPS:        {:.0} tx/s", con_tps);
         println!("  Consensus BPS:        {:.0} B/s", con_bps);

@@ -38,7 +38,12 @@ impl TransactionGenerator {
      */
 
     pub fn generate(&mut self) -> Vec<Transaction> {
-        (0..self.transactions_per_block).map(|_| {
+        self.generate_n(self.transactions_per_block)
+    }
+
+    /// `count` fresh transactions, for batches whose size follows the load.
+    pub fn generate_n(&mut self, count: usize) -> Vec<Transaction> {
+        (0..count).map(|_| {
             let id = self.next_id;
             self.next_id = self.next_id.wrapping_add(1);
             Transaction::with_id(self.padding, id)
