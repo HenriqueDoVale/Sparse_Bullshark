@@ -57,6 +57,9 @@ const DEFAULT_RETENTION_ROUNDS: u64 = 50;
 // After each full pass over the voters with no valid answer, the wait between
 // requests doubles, up to 2^3 = 8 x RECOVERY_TIMEOUT_MS.
 const MAX_RECOVERY_BACKOFF_SHIFT: u32 = 3;
+// Votes, vote records and other pre-quorum state are kept this many rounds
+// behind the last ordered round (prune_prbc_caches).
+const VOTE_RECORD_ROUNDS: u64 = 128;
 
 // ── Protocol constants ────────────────────────────────────────────────────────
 // Sample size = PRBC_C * sqrt(n), rounded up. Default 1.4 (ceil ≈ 4 for n=8) is
@@ -1401,7 +1404,7 @@ impl PRBCSailfish {
     /// Prune payload and vote caches for rounds that are too old to need recovery.
     fn prune_prbc_caches(&mut self) {
         // Pre-quorum vertices, votes and timeouts are small; keep 128 rounds.
-        let cutoff = self.last_ordered_round.saturating_sub(128);
+        let cutoff = self.last_ordered_round.saturating_sub(VOTE_RECORD_ROUNDS);
         let to_remove: Vec<VertexHash> = self.prbc_payloads
             .iter()
             .filter(|(_, v)| v.round < cutoff)
@@ -2027,6 +2030,11 @@ impl PRBCSailfish {
         let round = vertex.round;
         if round == 0 {
             return ParentCheck::Invalid("round 0 is genesis");
+        }
+        // Our record of votes that old is pruned, so a vote there could be a
+        // second vote for the slot. Never vote that far back.
+        if round < self.last_ordered_round.saturating_sub(VOTE_RECORD_ROUNDS) {
+            return ParentCheck::Invalid("too old: the vote record for its round is pruned");
         }
         if round == 1 {
             let genesis = vec![0u8; 32];
