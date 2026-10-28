@@ -748,7 +748,15 @@ impl PRBCSailfish {
     }
 
     fn quorum(&self) -> usize {
-        if self.reduced_quorum { self.f + 1 } else { 2 * self.f + 1 }
+        // n − f: any two quorums then share f+1 parties, one of them correct,
+        // for every n ≥ 3f+1. It equals 2f+1 only when n = 3f+1; at n = 50
+        // (f = 16) 2f+1 = 33 quorums could overlap in Byzantine parties only.
+        // Same threshold as Narwhal's ⌊2n/3⌋+1.
+        if self.reduced_quorum {
+            self.f + 1
+        } else {
+            self.environment.nodes.len() - self.f
+        }
     }
 
     fn leader_of(&self, round: u64) -> NodeId {
@@ -2050,7 +2058,7 @@ impl PRBCSailfish {
             return ParentCheck::Invalid("repeated edge");
         }
         if vertex.edges.len() < self.quorum() {
-            return ParentCheck::Invalid("fewer than 2f+1 strong edges");
+            return ParentCheck::Invalid("fewer than a quorum of strong edges");
         }
 
         let mut missing = Vec::new();
@@ -2213,7 +2221,7 @@ impl PRBCSailfish {
             || !msg.votes.keys().all(|voter| self.public_keys.contains_key(voter))
         {
             warn!(
-                "[Node {}] Certificate round={} source={}: fewer than 2f+1 valid votes",
+                "[Node {}] Certificate round={} source={}: fewer than a quorum of valid votes",
                 self.environment.my_node.id, msg.round, msg.source
             );
             return;
@@ -3209,7 +3217,11 @@ impl PRBCSailfish {
                 )
             };
 
-        let quorum_label = if self.reduced_quorum { "f+1" } else { "2f+1" };
+        let quorum_label = if self.reduced_quorum {
+            format!("f+1 = {}", self.quorum())
+        } else {
+            format!("n-f = {}", self.quorum())
+        };
         let max_batch_delay_label = match self.max_batch_delay_ms {
             None => "disabled".to_string(),
             Some(ms) => {
