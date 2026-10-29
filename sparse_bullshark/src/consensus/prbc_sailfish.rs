@@ -594,6 +594,7 @@ pub struct PRBCSailfish {
     // a network fetch (almost never: the propose/batch normally arrives first).
     payload_lag_count: usize,         // hash-quorum reached before the local payload
     payload_post_quorum_count: usize, // propose then arrived on its own — no fetch needed
+    votes_post_quorum: usize,         // own votes for a slot already certified here
     recovery_requests_sent: usize,    // PRBCRecovery messages actually put on the wire
     recovery_responses_ok: usize,     // valid PRBCRecoveryResp certificates applied locally
     recovery_responses_served: usize, // PRBCRecoveryResp this node sent to answer a peer
@@ -747,6 +748,7 @@ impl PRBCSailfish {
 
             payload_lag_count: 0,
             payload_post_quorum_count: 0,
+            votes_post_quorum: 0,
             recovery_requests_sent: 0,
             recovery_responses_ok: 0,
             recovery_responses_served: 0,
@@ -1339,9 +1341,11 @@ impl PRBCSailfish {
         // If we already have the payload, mark execution-ready immediately (move, no clone).
         if let Some(full_vertex) = self.prbc_payloads.remove(&hash) {
             self.on_execution_ready(hash.clone(), full_vertex, dispatcher_tx).await;
-        } else if let Some((_, full_vertex, _)) = self.parked_on_parents.remove(&hash) {
-            // Vertex and batch are here; we were only holding back our vote
-            // until its parents were certified. A certified vertex needs none.
+        } else if let Some((_, full_vertex, _)) = self.parked_on_parents.get(&hash) {
+            // Vertex and batch are here; only our vote was waiting for its
+            // parents. Deliver now. It stays parked, so we still vote once its
+            // parents are certified: validity needs every correct vote.
+            let full_vertex = full_vertex.clone();
             self.on_execution_ready(hash.clone(), full_vertex, dispatcher_tx).await;
         } else if source != self.environment.my_node.id {
             // Hash-quorum before local payload. Arm a recovery state machine;
@@ -1662,10 +1666,12 @@ impl PRBCSailfish {
         let v_round = vertex.round;
         let v_source = vertex.source;
 
-        // Payload already stored or fully execution-ready — nothing to do.
+        // Already voted for, or parked. A vertex delivered before this
+        // process voted is not skipped: it still votes for it below.
         if self.prbc_payloads.contains_key(&hash)
-            || self.execution_ready.contains(&hash)
             || self.parked_on_parents.contains_key(&hash)
+            || (self.execution_ready.contains(&hash)
+                && self.voted_hashes.contains_key(&(v_round, v_source)))
         {
             return;
         }
@@ -1707,24 +1713,41 @@ impl PRBCSailfish {
                 }
             }
             let waiters = self.pending_on_batch.entry(digest).or_default();
-            if !waiters.iter().any(|(_, pending, _)| pending.hash == hash) {
-                waiters.push((sender, vertex, signature));
+            match waiters.iter_mut().find(|(_, pending, _)| pending.hash == hash) {
+                // A copy fetched by recovery is unsigned; keep this signed
+                // one, which can still be voted for.
+                Some(waiter) if waiter.2.is_empty() => *waiter = (sender, vertex, signature),
+                Some(_) => {}
+                None => waiters.push((sender, vertex, signature)),
             }
             return;
         }
 
-        if let Some(committed_hash) = self.hash_committed.get(&(v_round, v_source)) {
-            if committed_hash != &hash {
+        // Certified before this process voted: the votes outran the vertex or
+        // its batch. Deliver it now, and still vote below. Byzantine voters
+        // may send their votes to only some processes, so validity needs the
+        // vote of every correct process.
+        let certified_first = match self.hash_committed.get(&(v_round, v_source)) {
+            Some(committed_hash) if committed_hash != &hash => {
                 warn!(
                     "[Node {}] PRBCPropose: conflicting hash for committed round={} source={}",
                     self.environment.my_node.id, v_round, v_source
                 );
                 return;
             }
-
-            self.payload_post_quorum_count += 1;
-            self.on_execution_ready(hash, vertex, dispatcher_tx).await;
-            return;
+            Some(_) => true,
+            None => false,
+        };
+        if certified_first {
+            if !self.execution_ready.contains(&hash) {
+                self.payload_post_quorum_count += 1;
+                self.on_execution_ready(hash.clone(), vertex.clone(), dispatcher_tx).await;
+            }
+            // A vertex fetched by recovery carries no signature of its
+            // source; the vote waits for the source's own propose.
+            if signature.is_empty() && self.sign_votes {
+                return;
+            }
         }
 
         // Vote only for a well-formed vertex whose parents are all certified
@@ -1733,11 +1756,15 @@ impl PRBCSailfish {
         match self.check_parents(&vertex) {
             ParentCheck::Ready => {}
             ParentCheck::Invalid(reason) => {
-                self.invalid_vertices += 1;
-                warn!(
-                    "[Node {}] PRBCPropose round={} source={}: {}, not voting",
-                    self.environment.my_node.id, v_round, v_source, reason
-                );
+                // f+1 correct voters found a certified vertex valid; only a
+                // late copy of one can fail here ("too old").
+                if !certified_first {
+                    self.invalid_vertices += 1;
+                    warn!(
+                        "[Node {}] PRBCPropose round={} source={}: {}, not voting",
+                        self.environment.my_node.id, v_round, v_source, reason
+                    );
+                }
                 return;
             }
             ParentCheck::Missing(parents) => {
@@ -1766,6 +1793,13 @@ impl PRBCSailfish {
         } else {
             self.voted_hashes
                 .insert((v_round, v_source), hash.clone());
+        }
+
+        if certified_first {
+            // Delivered already: nothing to relay or to hold for the quorum.
+            self.votes_post_quorum += 1;
+            self.cast_vote(v_round, v_source, hash, dispatcher_tx).await;
+            return;
         }
 
         // Record edges before vertex is moved.
@@ -1810,9 +1844,21 @@ impl PRBCSailfish {
                 .await;
         }
 
-        // Broadcast vote. When sign_votes is on, include an Ed25519 sig over
-        // the hash bound to its slot.
-        let my_sig = self.sign(&vote_signing_bytes(v_round, v_source, &hash));
+        self.cast_vote(v_round, v_source, hash, dispatcher_tx).await;
+    }
+
+    /// Broadcast this process's vote for (round, source, hash) and count it.
+    /// When sign_votes is on, the vote carries an Ed25519 sig over the hash
+    /// bound to its slot.
+    async fn cast_vote(
+        &mut self,
+        round: u64,
+        source: NodeId,
+        hash: VertexHash,
+        dispatcher_tx: &MessageDispatcher,
+    ) {
+        let my_id = self.environment.my_node.id;
+        let my_sig = self.sign(&vote_signing_bytes(round, source, &hash));
         // Byz5 withholds its votes from the highest-ID nodes as well.
         let vote_target = if self.environment.my_node.behavior == NodeBehavior::Byz5 {
             DispatchTarget::Many(self.lowest_peers())
@@ -1823,8 +1869,8 @@ impl PRBCSailfish {
             .send((
                 vote_target,
                 PRBCMessage::PRBCVote(PRBCVoteMessage {
-                    round: v_round,
-                    source: v_source,
+                    round,
+                    source,
                     hash: hash.clone(),
                     voter: my_id,
                     signature: my_sig.clone(),
@@ -1833,7 +1879,7 @@ impl PRBCSailfish {
             .await;
 
         // Count own vote locally.
-        self.record_vote(my_id, my_sig, v_round, v_source, hash, dispatcher_tx)
+        self.record_vote(my_id, my_sig, round, source, hash, dispatcher_tx)
             .await;
     }
 
@@ -2064,8 +2110,8 @@ impl PRBCSailfish {
         let digest = msg.vertex.block.clone();
         if !self.has_batch(&digest) {
             // Vertex recovered, batch not here. Park the vertex as a propose
-            // would be, and ask the same voters for the batch. It is
-            // certified, so it is never voted on and needs no signature.
+            // would be, and ask the same voters for the batch. It carries no
+            // signature, so it is not voted for; the source's propose is.
             let wait = Duration::from_millis(self.recovery_timeout_ms as u64);
             if let Some(state) = self.recovery_state.get_mut(&hash) {
                 state.switch_to_batch(digest.clone(), wait);
@@ -3468,6 +3514,7 @@ impl PRBCSailfish {
         println!("  Execution BPS:        {:.0} B/s", exe_bps);
         println!("  Payload-lag events:   {}", self.payload_lag_count);
         println!("  Payload post-quorum:  {}", self.payload_post_quorum_count);
+        println!("  Votes post-quorum:    {}", self.votes_post_quorum);
         println!("  Network recoveries:   {}", self.recovery_requests_sent);
         println!("  Recovery resp OK:     {}", self.recovery_responses_ok);
         println!("  Recovery resp served:  {}", self.recovery_responses_served);
